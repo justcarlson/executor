@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage } from "node:http";
 
 import { expect } from "@effect/vitest";
 import { Effect, Schema } from "effect";
+import { HttpClient } from "effect/unstable/http";
 import { composePluginApi } from "@executor-js/api/server";
 import { openApiHttpPlugin } from "@executor-js/plugin-openapi/api";
 import {
@@ -356,13 +357,25 @@ scenario(
           ).structuredContent;
           expect(other.items.some((tool) => tool.integration === otherSlug)).toBe(true);
 
+          // A local port probe can GET / before invoke. Keep such a request in
+          // the ledger so selecting the first GET reproduces #22 every run.
+          yield* HttpClient.get(upstream.url).pipe(Effect.flatMap((response) => response.text));
+          expect(upstream.requests).toContainEqual({
+            method: "GET",
+            path: "/",
+            authorization: undefined,
+            body: "",
+          });
+
           // --- A read call reaches the upstream with the connection's credential. ---
           const listed = yield* passthrough.call("invoke", { tool: listTool, arguments: {} });
           expect(listed.ok, `the read call completes: ${listed.text}`).toBe(true);
           expect(listed.text, "the upstream payload comes back").toContain("existing");
-          const listReq = upstream.requests.find((r) => r.method === "GET");
-          expect(listReq, "the GET reached the upstream").toBeDefined();
-          expect(listReq?.authorization, "the connection's credential was applied").toBe(
+          const listRequests = upstream.requests.filter(
+            (r) => r.method === "GET" && r.path === "/notes",
+          );
+          expect(listRequests, "one GET /notes reached the upstream").toHaveLength(1);
+          expect(listRequests[0]?.authorization, "the connection's credential was applied").toBe(
             `Bearer tok_${slug}`,
           );
 
@@ -376,7 +389,9 @@ scenario(
           );
           expect(created.text, "the call did not pause").not.toContain("Execution paused");
           expect(created.text, "the call did not ask for a resume").not.toContain("executionId");
-          const createReq = upstream.requests.find((r) => r.method === "POST");
+          const createReq = upstream.requests.find(
+            (r) => r.method === "POST" && r.path === "/notes",
+          );
           expect(createReq, "the POST reached the upstream").toBeDefined();
           expect(createReq?.body, "the JSON body went over the wire").toContain('"text":"hello"');
           expect(
