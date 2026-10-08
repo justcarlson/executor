@@ -42,6 +42,7 @@ export {
   AccountApi,
   AccountHttpApi,
   AccountError,
+  AccountUnavailable,
   AccountForbidden,
   AccountNoOrganization,
   AccountUnauthorized,
