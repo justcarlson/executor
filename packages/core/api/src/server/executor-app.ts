@@ -268,7 +268,7 @@ export interface AppExtensions {
 // The identity seam's failure channel (`Unauthorized | NoOrganization |
 // Unavailable`) lives in `./identity` now that BOTH apps provide the neutral
 // `IdentityProvider`. The failure strategy renders it: self-host catches it into
-// 401/403/503 text (`textFailureStrategy`; it never produces `Unavailable`);
+// 401/403/503 text (`textFailureStrategy`);
 // cloud's strategy renders its exact 401/403/503 `{ error, code }` JSON bytes.
 export type { IdentityFailure };
 

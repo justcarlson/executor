@@ -1,6 +1,6 @@
 import { Effect, Layer } from "effect";
 
-import { IdentityProvider } from "@executor-js/api/server";
+import { IdentityProvider, type Unavailable } from "@executor-js/api/server";
 import type {
   McpAuthProvider,
   McpErrorReporter,
@@ -9,7 +9,7 @@ import type {
 } from "@executor-js/host-mcp";
 
 import { BetterAuth, type BetterAuthHandle } from "../auth/better-auth";
-import { resolveSelfHostOrgRole } from "../auth/identity";
+import { requireInstanceMembership } from "../auth/identity";
 import type { SelfHostDbHandle } from "../db/self-host-db";
 import type { SelfHostConfig } from "../config";
 import { selfHostMcpAuth } from "./auth";
@@ -87,21 +87,27 @@ type BetterAuthSession = NonNullable<
 const principalFromSession = (
   resolved: BetterAuthSession,
   betterAuth: BetterAuthHandle,
-  headers: Headers,
-): Effect.Effect<Principal> => {
+): Effect.Effect<Principal | null, Unavailable> => {
   const organizationId = resolved.session.activeOrganizationId ?? betterAuth.organizationId;
-  return resolveSelfHostOrgRole(betterAuth, headers, organizationId).pipe(
-    Effect.map((orgRole) => ({
-      accountId: resolved.user.id,
-      organizationId,
-      organizationName: betterAuth.organizationName,
-      email: resolved.user.email,
-      name: resolved.user.name ?? null,
-      avatarUrl: resolved.user.image ?? null,
-      roles: parseRoles(resolved.user.role ?? null),
-      orgRoleModel: "organization" as const,
-      orgRole,
-    })),
+  // A session names a user; the member row names a member. A removed member's
+  // session must not reach a paused execution or record an approval decision.
+  return requireInstanceMembership(betterAuth, resolved.user.id, organizationId).pipe(
+    Effect.catchTag("NoOrganization", () => Effect.succeed(null)),
+    Effect.map((orgRole) =>
+      orgRole === null
+        ? null
+        : ({
+            accountId: resolved.user.id,
+            organizationId,
+            organizationName: betterAuth.organizationName,
+            email: resolved.user.email,
+            name: resolved.user.name ?? null,
+            avatarUrl: resolved.user.image ?? null,
+            roles: parseRoles(resolved.user.role ?? null),
+            orgRoleModel: "organization" as const,
+            orgRole,
+          } satisfies Principal),
+    ),
   );
 };
 
@@ -126,14 +132,22 @@ const makeApprovalHandler =
       }).pipe(Effect.orElseSucceed(() => null)),
     );
     if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
-    const principal = await Effect.runPromise(
-      principalFromSession(session, betterAuth, request.headers),
-    );
-
-    return (
-      (await store.handlePausedRequest(request, principal)) ??
-      (await store.handleApprovalRequest(request, principal)) ??
-      jsonResponse({ error: "Not found" }, 404)
+    return Effect.runPromise(
+      principalFromSession(session, betterAuth).pipe(
+        Effect.flatMap((principal) =>
+          principal
+            ? Effect.promise(
+                async () =>
+                  (await store.handlePausedRequest(request, principal)) ??
+                  (await store.handleApprovalRequest(request, principal)) ??
+                  jsonResponse({ error: "Not found" }, 404),
+              )
+            : Effect.succeed(jsonResponse({ error: "Forbidden" }, 403)),
+        ),
+        Effect.catchTag("Unavailable", () =>
+          Effect.succeed(jsonResponse({ error: "Membership lookup unavailable" }, 503)),
+        ),
+      ),
     );
   };
 

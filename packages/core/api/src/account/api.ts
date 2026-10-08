@@ -28,6 +28,12 @@ export class AccountError extends Schema.TaggedErrorClass<AccountError>()(
   { httpApiStatus: 500 },
 ) {}
 
+export class AccountUnavailable extends Schema.TaggedErrorClass<AccountUnavailable>()(
+  "AccountUnavailable",
+  { message: Schema.String },
+  { httpApiStatus: 503 },
+) {}
+
 export class AccountForbidden extends Schema.TaggedErrorClass<AccountForbidden>()(
   "AccountForbidden",
   { message: Schema.optional(Schema.String) },
@@ -190,27 +196,27 @@ export const AccountApi = HttpApiGroup.make("account")
   .add(
     HttpApiEndpoint.get("me", "/account/me", {
       success: AccountMeResponse,
-      error: [AccountError, AccountUnauthorized],
+      error: [AccountUnavailable, AccountError, AccountUnauthorized],
     }),
   )
   .add(
     HttpApiEndpoint.get("listApiKeys", "/account/api-keys", {
       success: ApiKeysResponse,
-      error: [AccountError, AccountUnauthorized, AccountNoOrganization],
+      error: [AccountUnavailable, AccountError, AccountUnauthorized, AccountNoOrganization],
     }),
   )
   .add(
     HttpApiEndpoint.post("createApiKey", "/account/api-keys", {
       payload: CreateApiKeyBody,
       success: CreatedApiKeyResponse,
-      error: [AccountError, AccountUnauthorized, AccountNoOrganization],
+      error: [AccountUnavailable, AccountError, AccountUnauthorized, AccountNoOrganization],
     }),
   )
   .add(
     HttpApiEndpoint.delete("revokeApiKey", "/account/api-keys/:apiKeyId", {
       params: ApiKeyParams,
       success: SuccessResponse,
-      error: [AccountError, AccountUnauthorized, AccountNoOrganization],
+      error: [AccountUnavailable, AccountError, AccountUnauthorized, AccountNoOrganization],
     }),
   )
   .add(
