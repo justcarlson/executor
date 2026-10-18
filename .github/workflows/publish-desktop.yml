@@ -48,7 +48,6 @@ env:
 
 jobs:
   build:
-    if: github.repository == 'UsefulSoftwareCo/executor'
     permissions:
       contents: read
     strategy:
@@ -267,7 +266,7 @@ jobs:
     needs: build
     # dry_run builds and uploads workflow artifacts but never touches the
     # GitHub release — used to rehearse workflow changes against a real tag.
-    if: github.repository == 'UsefulSoftwareCo/executor' && !inputs.dry_run
+    if: ${{ !inputs.dry_run }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
@@ -317,7 +316,8 @@ jobs:
             -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \
             -o -name "*.blockmap" \
             -o -name "latest*.yml" \) -print0 \
-            | xargs -0 -P8 -I{} gh release upload "$RELEASE_TAG" {} --repo "$GITHUB_REPOSITORY" --clobber
+            | xargs -0 -n1 -P8 -I{} sh -c \
+              'echo "Uploading: $1"; exec gh release upload "$RELEASE_TAG" "$1" --repo "$GITHUB_REPOSITORY" --clobber' _ {}
 
       # A published release must imply the npm packages for this tag exist.
       # Publish Executor triggers this workflow before its npm publishes (to

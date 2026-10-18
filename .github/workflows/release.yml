@@ -27,7 +27,6 @@ env:
 
 jobs:
   release:
-    if: github.repository == 'UsefulSoftwareCo/executor'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -80,7 +79,9 @@ jobs:
           # PAT (RELEASE_PAT) so the auto-opened Version Packages PR
           # triggers downstream workflows (pkg-pr-new, CI). PRs authored
           # by the default GITHUB_TOKEN do not trigger other workflows by
-          # GitHub design.
+          # GitHub design. Falls back to GITHUB_TOKEN when the secret is
+          # not set, so the workflow keeps working in forks / before the
+          # secret is configured.
           GITHUB_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Smoke test packed @executor-js library packages

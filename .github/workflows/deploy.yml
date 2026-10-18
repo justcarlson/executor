@@ -21,7 +21,6 @@ env:
 
 jobs:
   migrate:
-    if: github.repository == 'UsefulSoftwareCo/executor'
     name: Migrate database
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: production
@@ -69,7 +68,6 @@ jobs:
           WORKOS_API_KEY: ${{ secrets.WORKOS_API_KEY }}
 
   deploy-cloud:
-    if: github.repository == 'UsefulSoftwareCo/executor'
     name: Deploy cloud
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: production
@@ -127,7 +125,6 @@ jobs:
             || echo "deploy marker ingest failed (non-blocking)"
 
   deploy-marketing:
-    if: github.repository == 'UsefulSoftwareCo/executor'
     name: Deploy marketing
     runs-on: blacksmith-4vcpu-ubuntu-2404
     environment: production

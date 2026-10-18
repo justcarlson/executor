@@ -28,7 +28,6 @@ env:
 
 jobs:
   sweep:
-    if: github.repository == 'UsefulSoftwareCo/executor'
     name: Destroy previews for closed PRs
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:

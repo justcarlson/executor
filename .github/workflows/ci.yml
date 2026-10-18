@@ -429,7 +429,7 @@ jobs:
             -v "$PWD/resources/executor:/opt/executor:ro" \
             debian:bookworm-slim /opt/executor/executor daemon run --foreground \
             --port 45841 --hostname 0.0.0.0 --auth-token=ci-smoke
-          for _ in $(seq 1 60); do
+          for i in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ci-smoke" http://127.0.0.1:45841/api/onepassword/vaults || true)
             [ "$code" != "000" ] && break
             docker ps -q -f name=sidecar-smoke | grep -q . || { docker logs sidecar-smoke; exit 1; }
