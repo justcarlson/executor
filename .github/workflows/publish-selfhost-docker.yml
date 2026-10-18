@@ -30,6 +30,7 @@ env:
 
 jobs:
   metadata:
+    if: github.repository == 'UsefulSoftwareCo/executor'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
@@ -108,6 +109,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build:
+    if: github.repository == 'UsefulSoftwareCo/executor'
     needs: metadata
     strategy:
       fail-fast: false
@@ -182,6 +184,7 @@ jobs:
   # v1.5.30 exactly this way); per-arch matters too — the libsql native-addon
   # bug was arm64-only.
   e2e:
+    if: github.repository == 'UsefulSoftwareCo/executor'
     needs:
       - metadata
       - build
@@ -286,6 +289,7 @@ jobs:
           retention-days: 7
 
   merge:
+    if: github.repository == 'UsefulSoftwareCo/executor'
     needs:
       - metadata
       - build
@@ -345,6 +349,7 @@ jobs:
   # it, and a failure here (an expired GHCR_LEGACY_TOKEN, historically) shows
   # as one red job pointing at exactly what to fix.
   mirror-legacy:
+    if: github.repository == 'UsefulSoftwareCo/executor'
     needs:
       - metadata
       - merge
