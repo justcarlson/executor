@@ -5,7 +5,7 @@ on:
     paths:
       - .github/**
   push:
-    branches: [main, ci/swarm-executor]
+    branches: [main]
     paths:
       - .github/**
   workflow_dispatch:
