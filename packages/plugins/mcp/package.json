@@ -66,8 +66,8 @@
     "@effect/platform-node": "catalog:",
     "@executor-js/config": "workspace:*",
     "@executor-js/sdk": "workspace:*",
-    "@modelcontextprotocol/client": "2.0.0",
-    "@modelcontextprotocol/core": "2.0.0",
+    "@modelcontextprotocol/client": "2.3.1",
+    "@modelcontextprotocol/core": "2.3.1",
     "@modelcontextprotocol/sdk": "^1.32.1",
     "lucide-react": "^1.7.0",
     "zod": "4.3.6"

@@ -238,6 +238,9 @@ const guardFetch = (
         ...currentInit,
         redirect: "manual",
       });
+      const redirect =
+        currentInit?.redirect ?? (current instanceof Request ? current.redirect : "follow");
+      if (redirect === "manual") return response;
       if (
         response.status >= 300 &&
         response.status < 400 &&

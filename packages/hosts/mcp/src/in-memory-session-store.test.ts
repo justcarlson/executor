@@ -1,4 +1,5 @@
-import { describe, expect, it } from "@effect/vitest";
+import assert from "node:assert/strict";
+import { describe, expect, it, onTestFinished } from "@effect/vitest";
 import { Effect, type Cause } from "effect";
 
 import type { ExecutionEngine } from "@executor-js/execution";
@@ -888,5 +889,85 @@ describe("pre-initialize dispatch through the in-memory session store", () => {
     await sessions.close();
     expect(executorClosed).toBe(1);
     expect(sessions.sessionCount()).toBe(0);
+  });
+});
+
+describe("MCP request body limit", () => {
+  for (const session of [false, true]) {
+    for (const length of [undefined, "1", "4194305"]) {
+      it(`rejects an oversized ${session ? "session" : "initialize"} body with Content-Length ${length ?? "absent"}`, async () => {
+        const { sessions } = makeServingStore();
+        let sessionId: string | null = null;
+        onTestFinished(() => sessions.close());
+        if (session) sessionId = await initializeWith(sessions, {});
+        const headers = new Headers(MCP_POST_HEADERS);
+        if (sessionId) headers.set("mcp-session-id", sessionId);
+        if (length !== undefined) headers.set("content-length", length);
+        const text = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: session ? "ping" : "initialize",
+          params: { padding: "é".repeat(2 * 1024 * 1024) },
+        });
+        const bytes = new TextEncoder().encode(text);
+        const request = new Request("https://executor.test/mcp", {
+          method: "POST",
+          headers,
+          body: new ReadableStream<Uint8Array>({
+            start(controller) {
+              for (let offset = 0; offset < bytes.length; offset += 65536) {
+                controller.enqueue(bytes.subarray(offset, offset + 65536));
+              }
+              controller.close();
+            },
+          }),
+          duplex: "half",
+        });
+        const result = await Effect.runPromise(
+          sessions.store.dispatch({
+            request,
+            principal: TEST_PRINCIPAL,
+            resource: defaultMcpResource,
+            sessionId,
+            method: "POST",
+          }),
+        );
+        expect(result).toBeInstanceOf(Response);
+        assert(result instanceof Response);
+        expect(result.status).toBe(413);
+        expect(await result.json()).toEqual({
+          jsonrpc: "2.0",
+          id: null,
+          error: {
+            code: -32000,
+            message: "Payload Too Large: Request body must not exceed 4194304 bytes",
+          },
+        });
+      });
+    }
+  }
+
+  it("accepts a normal initialize and a body exactly at the byte limit", async () => {
+    const { sessions } = makeServingStore();
+    onTestFinished(() => sessions.close());
+    const sessionId = await initializeWith(sessions, {});
+    const message = JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" });
+    const result = await Effect.runPromise(
+      sessions.store.dispatch({
+        request: new Request("https://executor.test/mcp", {
+          method: "POST",
+          headers: { ...MCP_POST_HEADERS, "mcp-session-id": sessionId },
+          body: message + " ".repeat(4194304 - message.length),
+        }),
+        principal: TEST_PRINCIPAL,
+        resource: defaultMcpResource,
+        sessionId,
+        method: "POST",
+      }),
+    );
+    expect(result).toBeInstanceOf(Response);
+    assert(result instanceof Response);
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ jsonrpc: "2.0", id: 2, result: {} });
   });
 });

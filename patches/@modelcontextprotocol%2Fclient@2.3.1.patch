@@ -20,7 +20,7 @@ index 02d2730aca540adf88d52487ec3f3a9b3f8e80ee..beb9604d2f7f486f711ef4ba7f93a85c
 --- a/dist/shimsWorkerd.mjs
 +++ b/dist/shimsWorkerd.mjs
 @@ -1,4 +1,3 @@
--import { n as preloadSchemas } from "./src-D_zzAWoS.mjs";
+-import { n as preloadSchemas } from "./src-WCy6ifGf.mjs";
  import { t as CfWorkerJsonSchemaValidator } from "./cfWorkerProvider-BylNJ1R5.mjs";
  
  //#region src/shimsWorkerd.ts
