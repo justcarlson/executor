@@ -1,5 +1,10 @@
 import { Cause, Data, Effect, Layer } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  readRequestBody,
+  requestBodyTooLargeMessage,
+  DEFAULT_MAX_REQUEST_BODY_SIZE,
+} from "@modelcontextprotocol/sdk/server/requestBody.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 
 import { formatPausedExecution, type ExecutionEngine } from "@executor-js/execution";
@@ -206,6 +211,40 @@ const ignoreClose = (
 const jsonRpcError = (status: number, code: number, message: string): Response =>
   jsonRpcErrorBody(status, code, message, { cors: false });
 
+const withBoundedPostBody = (
+  request: Request,
+  handle: (request: Request) => Effect.Effect<McpDispatchResult>,
+): Effect.Effect<McpDispatchResult> =>
+  request.method !== "POST"
+    ? handle(request)
+    : Effect.tryPromise({
+        try: () => readRequestBody(request),
+        catch: () => jsonRpcError(400, -32700, "Parse error: Invalid JSON"),
+      }).pipe(
+        Effect.matchEffect({
+          onFailure: (response) => Effect.succeed(response),
+          onSuccess: (body) => {
+            if (body.tooLarge) {
+              return Effect.succeed(
+                jsonRpcError(
+                  413,
+                  -32000,
+                  requestBodyTooLargeMessage(DEFAULT_MAX_REQUEST_BODY_SIZE),
+                ),
+              );
+            }
+            return handle(
+              new Request(request.url, {
+                method: request.method,
+                headers: request.headers,
+                signal: request.signal,
+                body: body.text,
+              }),
+            );
+          },
+        }),
+      );
+
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 
@@ -411,9 +450,9 @@ export const makeInMemoryMcpSessionStore = (
     // interrupt, so the counter cannot be left permanently raised (which would
     // make the session immortal, the opposite leak).
     beginRequest(sessionId);
-    return runHandleRequest(transport, request, orgWriteAccessForPrincipal(principal)).pipe(
-      Effect.ensuring(Effect.sync(() => endRequest(sessionId))),
-    );
+    return withBoundedPostBody(request, (bounded) =>
+      runHandleRequest(transport, bounded, orgWriteAccessForPrincipal(principal)),
+    ).pipe(Effect.ensuring(Effect.sync(() => endRequest(sessionId))));
   };
 
   /**
@@ -528,11 +567,13 @@ export const makeInMemoryMcpSessionStore = (
     resource: McpResource,
     request: Request,
   ): Effect.Effect<McpDispatchResult> =>
-    preInitializeMethodNotFound(request).pipe(
-      Effect.flatMap((unsupported) =>
-        unsupported
-          ? Effect.succeed<McpDispatchResult>(unsupported)
-          : openSession(principal, resource, request),
+    withBoundedPostBody(request, (bounded) =>
+      preInitializeMethodNotFound(bounded).pipe(
+        Effect.flatMap((unsupported) =>
+          unsupported
+            ? Effect.succeed<McpDispatchResult>(unsupported)
+            : openSession(principal, resource, bounded),
+        ),
       ),
     );
 

@@ -1,6 +1,11 @@
 import type { Client, FetchLike, OAuthClientProvider } from "@modelcontextprotocol/client";
 import { Effect, Layer, Option, Predicate, Schema, Stream } from "effect";
-import { HttpClient, HttpClientError, HttpClientRequest } from "effect/unstable/http";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpClientError,
+  HttpClientRequest,
+} from "effect/unstable/http";
 
 // NOTE: nothing from `@modelcontextprotocol/client` is imported eagerly —
 // value access goes through `loadMcpClientSdk` (see client-module.ts for the
@@ -304,7 +309,9 @@ const fetchFromHttpClientLayer = (
     const request = await applyBody(requestWithoutBody, headers, init?.body);
     const effect = Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient;
-      const response = yield* client.execute(request);
+      const response = yield* client
+        .execute(request)
+        .pipe(Effect.provideService(FetchHttpClient.RequestInit, { redirect: init?.redirect }));
       const responseHeaders = new Headers();
       for (const [key, value] of Object.entries(response.headers)) {
         if (value !== undefined) responseHeaders.set(key, value);
