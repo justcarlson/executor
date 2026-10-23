@@ -16,14 +16,19 @@ import { executeWithinOrigin } from "./within-origin-redirect";
 interface TestServer {
   readonly url: string;
   readonly paths: string[];
+  /** Paths whose server response emitted `close`. Bun's `node:http` server never emits it. */
+  readonly closed: string[];
 }
 
 const serve = async (
   handler: (request: IncomingMessage, response: ServerResponse) => void,
 ): Promise<TestServer> => {
   const paths: string[] = [];
+  const closed: string[] = [];
   const server: Server = createServer((request, response) => {
-    paths.push(request.url ?? "/");
+    const path = request.url ?? "/";
+    paths.push(path);
+    response.on("close", () => closed.push(path));
     request.resume();
     handler(request, response);
   });
@@ -34,24 +39,27 @@ const serve = async (
   });
   const address = server.address();
   assert(address !== null && typeof address !== "string");
-  return { url: `http://127.0.0.1:${address.port}`, paths };
+  return { url: `http://127.0.0.1:${address.port}`, paths, closed };
 };
 
 const ok = (response: ServerResponse) => response.writeHead(200).end("ok");
+
+const isBun = "Bun" in globalThis;
 
 // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the spy records each request's abort signal and must delegate to the platform fetch
 const platformFetch: typeof globalThis.fetch = globalThis.fetch;
 
 const layers = {
-  fetch: (fetch: typeof globalThis.fetch) =>
-    FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch))),
-  hosted: (fetch: typeof globalThis.fetch) =>
-    makeHostedHttpClientLayer({ allowLocalNetwork: true, fetch }),
+  fetch: FetchHttpClient.layer,
+  hosted: makeHostedHttpClientLayer({ allowLocalNetwork: true }),
 } as const;
 
-/** Runs `request` through the helper. `whileOpen` runs before the caller's scope
- *  closes, with the abort state of each fetch the client made so far. Releasing a
- *  response aborts its fetch, so this observes the release in any runtime. */
+/** Runs `request` through the helper on the production layer, with a spy as its
+ *  `FetchHttpClient.Fetch`. `whileOpen` runs before the caller's scope closes,
+ *  with the abort state of each fetch the client made so far. `releasedBefore`
+ *  has one entry per fetch that starts after a redirect: whether every earlier
+ *  redirect fetch was already aborted. Releasing a response aborts its fetch, so
+ *  both observe the release in any runtime. */
 const run = <A>(
   layer: keyof typeof layers,
   request: HttpClientRequest.HttpClientRequest,
@@ -61,11 +69,17 @@ const run = <A>(
   ) => Effect.Effect<A, HttpClientError.HttpClientError>,
 ) => {
   const signals: AbortSignal[] = [];
-  const fetch: typeof globalThis.fetch = (input, init) => {
+  const redirects: AbortSignal[] = [];
+  const releasedBefore: boolean[] = [];
+  const spy = (async (input, init) => {
+    if (redirects.length > 0) releasedBefore.push(redirects.every((signal) => signal.aborted));
     assert(init?.signal);
-    signals.push(init.signal);
-    return platformFetch(input, init);
-  };
+    const signal = init.signal;
+    signals.push(signal);
+    const response = await platformFetch(input, init);
+    if (response.status >= 300 && response.status < 400) redirects.push(signal);
+    return response;
+  }) as typeof globalThis.fetch;
   return Effect.runPromise(
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient;
@@ -74,10 +88,10 @@ const run = <A>(
       return { status: response.status, whileOpen: yield* whileOpen(response, aborted) };
     }).pipe(
       Effect.scoped,
-      Effect.provide(layers[layer](fetch)),
+      Effect.provide(layers[layer].pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(spy)))),
       Effect.timeout(Duration.seconds(3)),
     ),
-  );
+  ).then((result) => ({ ...result, releasedBefore }));
 };
 
 const execute = (layer: keyof typeof layers, request: HttpClientRequest.HttpClientRequest) =>
@@ -244,15 +258,21 @@ describe("executeWithinOrigin", () => {
           Effect.succeed(aborted),
         );
 
-        expect(result).toEqual({ status: 307, whileOpen: [true] });
+        expect(result).toEqual({ status: 307, whileOpen: [true], releasedBefore: [] });
         expect(target.paths).toEqual([]);
       });
 
       it("cancels a followed redirect body and keeps the final body readable", async () => {
         const source = await serve((incoming, response) => {
-          if (incoming.url !== "/start") return ok(response);
-          response.writeHead(307, { location: "/next" });
-          response.write("a body that never ends");
+          if (incoming.url === "/start") {
+            response.writeHead(307, { location: "/next" });
+            response.write("a body that never ends");
+            return;
+          }
+          // The final body ends after the helper returns, so only a response
+          // that is still open reads it, in Node and in Bun.
+          response.writeHead(200).write("o");
+          setTimeout(() => response.end("k"), 100);
         });
 
         const result = await run(
@@ -261,9 +281,63 @@ describe("executeWithinOrigin", () => {
           (response, aborted) => Effect.map(response.text, (body) => ({ aborted, body })),
         );
 
-        expect(result).toEqual({ status: 200, whileOpen: { aborted: [true, false], body: "ok" } });
+        expect(result).toEqual({
+          status: 200,
+          whileOpen: { aborted: [true, false], body: "ok" },
+          releasedBefore: [true],
+        });
         expect(source.paths).toEqual(["/start", "/next"]);
       });
+
+      // Runtime split: the checks above see the client abort the redirect fetch
+      // in Node and in Bun. These see the server close the redirect response,
+      // which proves the connection is released. Bun's `node:http` server emits
+      // no response `close` event, so they run in Node only.
+      it.skipIf(isBun)(
+        "closes a refused redirect response on the server while the caller's scope is open (Node only: Bun's node:http server emits no response close)",
+        async () => {
+          const target = await serve((_, response) => ok(response));
+          const source = await serve((_, response) => {
+            response.writeHead(307, { location: `${target.url}/next` });
+            response.write("a body that never ends");
+          });
+
+          const result = await run(layer, request("GET", `${source.url}/start`), () =>
+            waitFor(() => source.closed.includes("/start")),
+          );
+
+          expect(result).toMatchObject({ status: 307, whileOpen: true });
+          expect(target.paths).toEqual([]);
+        },
+      );
+
+      it.skipIf(isBun)(
+        "closes a followed redirect response on the server while the caller's scope is open (Node only: Bun's node:http server emits no response close)",
+        async () => {
+          const source = await serve((incoming, response) => {
+            if (incoming.url !== "/start") return ok(response);
+            response.writeHead(307, { location: "/next" });
+            response.write("a body that never ends");
+          });
+
+          const result = await run(layer, request("GET", `${source.url}/start`), () =>
+            waitFor(() => source.closed.includes("/start")),
+          );
+
+          expect(result).toMatchObject({ status: 200, whileOpen: true });
+          expect(source.paths).toEqual(["/start", "/next"]);
+        },
+      );
     });
   }
 });
+
+/** Polls `condition` for up to one second while the caller's scope is open. */
+const waitFor = (condition: () => boolean): Effect.Effect<boolean> =>
+  Effect.gen(function* () {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if (condition()) return true;
+      yield* Effect.sleep(Duration.millis(20));
+    }
+    return condition();
+  });

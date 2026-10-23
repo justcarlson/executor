@@ -53,35 +53,41 @@ const serve = async (
 // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the spy records each request's abort signal and must delegate to the platform fetch
 const platformFetch: typeof globalThis.fetch = globalThis.fetch;
 
-const layerFor = (hosted: boolean, fetch: typeof globalThis.fetch = platformFetch) =>
-  hosted
-    ? makeHostedHttpClientLayer({ allowLocalNetwork: true, fetch })
-    : FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)));
+const layerFor = (hosted: boolean) =>
+  hosted ? makeHostedHttpClientLayer({ allowLocalNetwork: true }) : FetchHttpClient.layer;
 
-/** A fetch that records, as each request starts, whether every earlier request
- *  was already aborted. Releasing a response aborts its fetch, so this sees a
- *  redirect body released before the next hop, in any runtime and before the
- *  probe's own scope closes. */
+/** A fetch that records, as each request after a redirect starts, whether every
+ *  earlier request that got a redirect status was already aborted. Releasing a
+ *  response aborts its fetch, so this sees a redirect body released before the
+ *  next hop, in any runtime and before the probe's own scope closes. */
 const releaseRecorder = () => {
-  const signals: AbortSignal[] = [];
+  const redirects: AbortSignal[] = [];
   const earlierReleased: boolean[] = [];
-  const fetch = ((input, init) => {
-    earlierReleased.push(signals.every((signal) => signal.aborted));
+  const fetch = (async (input, init) => {
+    if (redirects.length > 0) earlierReleased.push(redirects.every((signal) => signal.aborted));
     assert(init?.signal);
-    signals.push(init.signal);
-    return platformFetch(input, init);
+    const signal = init.signal;
+    const response = await platformFetch(input, init);
+    if (response.status >= 300 && response.status < 400) redirects.push(signal);
+    return response;
   }) as typeof globalThis.fetch;
   return { fetch, earlierReleased };
 };
 
-const probe = (endpoint: string, hosted: boolean, fetch?: typeof globalThis.fetch) =>
-  Effect.runPromise(
+/** Probes `endpoint` on the production layer. A `fetch` spy, when given, is
+ *  provided from outside as the layer's `FetchHttpClient.Fetch`. */
+const probe = (endpoint: string, hosted: boolean, fetch?: typeof globalThis.fetch) => {
+  const layer = layerFor(hosted);
+  return Effect.runPromise(
     probeMcpEndpointShape(endpoint, {
       headers: { "X-API-Key": KEY },
       timeoutMs: 2_000,
-      httpClientLayer: layerFor(hosted, fetch),
+      httpClientLayer: fetch
+        ? layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)))
+        : layer,
     }),
   );
+};
 
 describe("probeMcpEndpointShape redirect credential protection", () => {
   for (const hosted of [false, true]) {
@@ -218,7 +224,7 @@ describe("probeMcpEndpointShape redirect credential protection", () => {
       expect(result).toMatchObject({ kind: "not-mcp", category: "wrong-shape" });
       expect(target.keys).toEqual([]);
       expect(source.paths.length).toBe(2);
-      expect(recorder.earlierReleased).toEqual([true, true]);
+      expect(recorder.earlierReleased).toEqual([true]);
     });
 
     it(`follows a same-origin redirect with an unfinished body through the ${layer} layer`, async () => {
@@ -231,7 +237,7 @@ describe("probeMcpEndpointShape redirect credential protection", () => {
       const result = await probe(`${server.url}/mcp`, hosted, recorder.fetch);
       expect(result).toEqual({ kind: "mcp", requiresAuth: false });
       expect(server.paths).toEqual(["/mcp", "/next"]);
-      expect(recorder.earlierReleased).toEqual([true, true]);
+      expect(recorder.earlierReleased).toEqual([true]);
     });
 
     it(`does not send the endpoint query across origins from probeEndpoint through the ${layer} layer`, async () => {
