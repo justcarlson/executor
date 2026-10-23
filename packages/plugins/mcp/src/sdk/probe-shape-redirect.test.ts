@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, expect, it, onTestFinished } from "@effect/vitest";
-import { Effect } from "effect";
+import { Effect, Layer } from "effect";
 import { FetchHttpClient } from "effect/unstable/http";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createExecutor } from "@executor-js/sdk";
@@ -31,15 +31,12 @@ const serve = async (
   readonly url: string;
   readonly keys: string[];
   readonly paths: string[];
-  readonly closed: () => number;
 }> => {
   const keys: string[] = [];
   const paths: string[] = [];
-  let closed = 0;
   const server: Server = createServer((request, response) => {
     keys.push(String(request.headers["x-api-key"]));
     paths.push(request.url ?? "/");
-    response.on("close", () => closed++);
     request.resume();
     handler(request, response);
   });
@@ -50,26 +47,39 @@ const serve = async (
   });
   const address = server.address();
   assert(address !== null && typeof address !== "string");
-  return { url: `http://127.0.0.1:${address.port}`, keys, paths, closed: () => closed };
+  return { url: `http://127.0.0.1:${address.port}`, keys, paths };
 };
 
-const layerFor = (hosted: boolean) =>
-  hosted ? makeHostedHttpClientLayer({ allowLocalNetwork: true }) : FetchHttpClient.layer;
+// oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the spy records each request's abort signal and must delegate to the platform fetch
+const platformFetch: typeof globalThis.fetch = globalThis.fetch;
 
-/** Waits up to one second for `condition`, for server events that trail the probe. */
-const eventually = async (condition: () => boolean): Promise<boolean> => {
-  for (let attempt = 0; attempt < 50 && !condition(); attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-  return condition();
+const layerFor = (hosted: boolean, fetch: typeof globalThis.fetch = platformFetch) =>
+  hosted
+    ? makeHostedHttpClientLayer({ allowLocalNetwork: true, fetch })
+    : FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch)));
+
+/** A fetch that records, as each request starts, whether every earlier request
+ *  was already aborted. Releasing a response aborts its fetch, so this sees a
+ *  redirect body released before the next hop, in any runtime and before the
+ *  probe's own scope closes. */
+const releaseRecorder = () => {
+  const signals: AbortSignal[] = [];
+  const earlierReleased: boolean[] = [];
+  const fetch = ((input, init) => {
+    earlierReleased.push(signals.every((signal) => signal.aborted));
+    assert(init?.signal);
+    signals.push(init.signal);
+    return platformFetch(input, init);
+  }) as typeof globalThis.fetch;
+  return { fetch, earlierReleased };
 };
 
-const probe = (endpoint: string, hosted: boolean) =>
+const probe = (endpoint: string, hosted: boolean, fetch?: typeof globalThis.fetch) =>
   Effect.runPromise(
     probeMcpEndpointShape(endpoint, {
       headers: { "X-API-Key": KEY },
       timeoutMs: 2_000,
-      httpClientLayer: layerFor(hosted),
+      httpClientLayer: layerFor(hosted, fetch),
     }),
   );
 
@@ -203,11 +213,12 @@ describe("probeMcpEndpointShape redirect credential protection", () => {
         response.writeHead(307, { location: `${target.url}/mcp` });
         response.write("a body that never ends");
       });
-      const result = await probe(`${source.url}/mcp`, hosted);
+      const recorder = releaseRecorder();
+      const result = await probe(`${source.url}/mcp`, hosted, recorder.fetch);
       expect(result).toMatchObject({ kind: "not-mcp", category: "wrong-shape" });
       expect(target.keys).toEqual([]);
       expect(source.paths.length).toBe(2);
-      expect(await eventually(() => source.closed() === source.paths.length)).toBe(true);
+      expect(recorder.earlierReleased).toEqual([true, true]);
     });
 
     it(`follows a same-origin redirect with an unfinished body through the ${layer} layer`, async () => {
@@ -216,16 +227,20 @@ describe("probeMcpEndpointShape redirect credential protection", () => {
         response.writeHead(307, { location: "/next" });
         response.write("a body that never ends");
       });
-      const result = await probe(`${server.url}/mcp`, hosted);
+      const recorder = releaseRecorder();
+      const result = await probe(`${server.url}/mcp`, hosted, recorder.fetch);
       expect(result).toEqual({ kind: "mcp", requiresAuth: false });
       expect(server.paths).toEqual(["/mcp", "/next"]);
+      expect(recorder.earlierReleased).toEqual([true, true]);
     });
 
     it(`does not send the endpoint query across origins from probeEndpoint through the ${layer} layer`, async () => {
       const target = await serve((_, response) => response.writeHead(404).end());
+      const challenges: string[] = [];
       const source = await serve((request, response) => {
         if (request.url?.includes("/.well-known/")) return response.writeHead(404).end();
         if (request.method === "GET" && request.headers.accept === "application/json") {
+          challenges.push(request.url ?? "/");
           return response.writeHead(302, { location: `${target.url}${request.url}` }).end();
         }
         response
@@ -256,7 +271,7 @@ describe("probeMcpEndpointShape redirect credential protection", () => {
         ).pipe(Effect.ensuring(Effect.promise(() => config.testDb.close()))),
       );
       expect(target.paths).toEqual([]);
-      expect(source.paths).toContain(`/mcp?api_key=${KEY}`);
+      expect(challenges).toEqual([`/mcp?api_key=${KEY}`]);
       expect(result).toMatchObject({ connected: false, requiresAuthentication: true });
     });
   }

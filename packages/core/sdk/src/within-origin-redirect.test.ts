@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { describe, expect, it, onTestFinished } from "@effect/vitest";
-import { Duration, Effect } from "effect";
-import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { Duration, Effect, Layer } from "effect";
+import {
+  FetchHttpClient,
+  HttpClient,
+  HttpClientRequest,
+  type HttpClientError,
+  type HttpClientResponse,
+} from "effect/unstable/http";
 
 import { makeHostedHttpClientLayer } from "./hosted-http-client";
 import { executeWithinOrigin } from "./within-origin-redirect";
@@ -10,18 +16,14 @@ import { executeWithinOrigin } from "./within-origin-redirect";
 interface TestServer {
   readonly url: string;
   readonly paths: string[];
-  readonly closed: string[];
 }
 
 const serve = async (
   handler: (request: IncomingMessage, response: ServerResponse) => void,
 ): Promise<TestServer> => {
   const paths: string[] = [];
-  const closed: string[] = [];
   const server: Server = createServer((request, response) => {
-    const path = request.url ?? "/";
-    paths.push(path);
-    response.on("close", () => closed.push(path));
+    paths.push(request.url ?? "/");
     request.resume();
     handler(request, response);
   });
@@ -32,29 +34,51 @@ const serve = async (
   });
   const address = server.address();
   assert(address !== null && typeof address !== "string");
-  return { url: `http://127.0.0.1:${address.port}`, paths, closed };
+  return { url: `http://127.0.0.1:${address.port}`, paths };
 };
 
 const ok = (response: ServerResponse) => response.writeHead(200).end("ok");
 
+// oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the spy records each request's abort signal and must delegate to the platform fetch
+const platformFetch: typeof globalThis.fetch = globalThis.fetch;
+
 const layers = {
-  fetch: FetchHttpClient.layer,
-  hosted: makeHostedHttpClientLayer({ allowLocalNetwork: true }),
+  fetch: (fetch: typeof globalThis.fetch) =>
+    FetchHttpClient.layer.pipe(Layer.provide(Layer.succeed(FetchHttpClient.Fetch)(fetch))),
+  hosted: (fetch: typeof globalThis.fetch) =>
+    makeHostedHttpClientLayer({ allowLocalNetwork: true, fetch }),
 } as const;
 
-/** Runs `request` through the helper. `whileOpen` runs before the caller's scope closes. */
+/** Runs `request` through the helper. `whileOpen` runs before the caller's scope
+ *  closes, with the abort state of each fetch the client made so far. Releasing a
+ *  response aborts its fetch, so this observes the release in any runtime. */
 const run = <A>(
   layer: keyof typeof layers,
   request: HttpClientRequest.HttpClientRequest,
-  whileOpen: (status: number) => Effect.Effect<A>,
-) =>
-  Effect.runPromise(
+  whileOpen: (
+    response: HttpClientResponse.HttpClientResponse,
+    aborted: readonly boolean[],
+  ) => Effect.Effect<A, HttpClientError.HttpClientError>,
+) => {
+  const signals: AbortSignal[] = [];
+  const fetch: typeof globalThis.fetch = (input, init) => {
+    assert(init?.signal);
+    signals.push(init.signal);
+    return platformFetch(input, init);
+  };
+  return Effect.runPromise(
     Effect.gen(function* () {
       const client = yield* HttpClient.HttpClient;
       const response = yield* executeWithinOrigin(client, request);
-      return { status: response.status, whileOpen: yield* whileOpen(response.status) };
-    }).pipe(Effect.scoped, Effect.provide(layers[layer]), Effect.timeout(Duration.seconds(3))),
+      const aborted = signals.map((signal) => signal.aborted);
+      return { status: response.status, whileOpen: yield* whileOpen(response, aborted) };
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(layers[layer](fetch)),
+      Effect.timeout(Duration.seconds(3)),
+    ),
   );
+};
 
 const execute = (layer: keyof typeof layers, request: HttpClientRequest.HttpClientRequest) =>
   run(layer, request, () => Effect.void).then(({ status }) => status);
@@ -216,38 +240,30 @@ describe("executeWithinOrigin", () => {
           response.write("a body that never ends");
         });
 
-        const result = await run(layer, request("GET", `${source.url}/start`), () =>
-          waitFor(() => source.closed.includes("/start")),
+        const result = await run(layer, request("GET", `${source.url}/start`), (_, aborted) =>
+          Effect.succeed(aborted),
         );
 
-        expect(result).toEqual({ status: 307, whileOpen: true });
+        expect(result).toEqual({ status: 307, whileOpen: [true] });
         expect(target.paths).toEqual([]);
       });
 
-      it("cancels a followed redirect body instead of reading it", async () => {
+      it("cancels a followed redirect body and keeps the final body readable", async () => {
         const source = await serve((incoming, response) => {
           if (incoming.url !== "/start") return ok(response);
           response.writeHead(307, { location: "/next" });
           response.write("a body that never ends");
         });
 
-        const result = await run(layer, request("GET", `${source.url}/start`), () =>
-          waitFor(() => source.closed.includes("/start")),
+        const result = await run(
+          layer,
+          request("GET", `${source.url}/start`),
+          (response, aborted) => Effect.map(response.text, (body) => ({ aborted, body })),
         );
 
-        expect(result).toEqual({ status: 200, whileOpen: true });
+        expect(result).toEqual({ status: 200, whileOpen: { aborted: [true, false], body: "ok" } });
         expect(source.paths).toEqual(["/start", "/next"]);
       });
     });
   }
 });
-
-/** Polls `condition` for up to one second while the caller's scope is open. */
-const waitFor = (condition: () => boolean): Effect.Effect<boolean> =>
-  Effect.gen(function* () {
-    for (let attempt = 0; attempt < 50; attempt++) {
-      if (condition()) return true;
-      yield* Effect.sleep(Duration.millis(20));
-    }
-    return condition();
-  });
