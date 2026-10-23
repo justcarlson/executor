@@ -30,6 +30,7 @@ import {
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
 import { parseChallenges } from "./www-authenticate";
+import { executeWithinOrigin } from "./within-origin-redirect";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -301,18 +302,18 @@ const discoverResourceMetadataChallenge = (
       }
       const client = yield* HttpClient.HttpClient;
       // Read headers only: an MCP GET can open a long-lived event stream.
-      const response = yield* HttpClient.withScope(client)
-        .execute(request)
-        .pipe(
-          Effect.timeout(Duration.millis(options.timeoutMs ?? OAUTH2_DEFAULT_TIMEOUT_MS)),
-          Effect.mapError(
-            (cause) =>
-              new OAuthDiscoveryError({
-                message: "Failed to discover the protected resource authentication challenge",
-                cause,
-              }),
-          ),
-        );
+      // The request carries the resource URL's query (often a credential),
+      // so it must not follow a redirect to another origin.
+      const response = yield* executeWithinOrigin(client, request).pipe(
+        Effect.timeout(Duration.millis(options.timeoutMs ?? OAUTH2_DEFAULT_TIMEOUT_MS)),
+        Effect.mapError(
+          (cause) =>
+            new OAuthDiscoveryError({
+              message: "Failed to discover the protected resource authentication challenge",
+              cause,
+            }),
+        ),
+      );
       if (response.status !== 401 && response.status !== 403) return null;
       const header = response.headers["www-authenticate"];
       if (header === undefined) return null;

@@ -44,6 +44,7 @@
 
 import { Data, Duration, Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { executeWithinOrigin } from "@executor-js/sdk";
 
 /** MCP initialize request body used as the shape probe. Any real MCP
  *  server either answers it (unauth-OK server) or returns the spec-
@@ -189,13 +190,12 @@ const probeProtectedResourceMetadata = (
   timeoutMs: number,
 ): Effect.Effect<boolean> =>
   Effect.gen(function* () {
-    const response = yield* client
-      .execute(
-        HttpClientRequest.get(protectedResourceMetadataUrl(endpoint)).pipe(
-          HttpClientRequest.setHeader("accept", "application/json"),
-        ),
-      )
-      .pipe(Effect.timeout(Duration.millis(timeoutMs)));
+    const response = yield* executeWithinOrigin(
+      client,
+      HttpClientRequest.get(protectedResourceMetadataUrl(endpoint)).pipe(
+        HttpClientRequest.setHeader("accept", "application/json"),
+      ),
+    ).pipe(Effect.timeout(Duration.millis(timeoutMs)));
     if (response.status < 200 || response.status >= 300) return false;
     const body = yield* response.text.pipe(
       Effect.timeout(Duration.millis(timeoutMs)),
@@ -205,7 +205,10 @@ const probeProtectedResourceMetadata = (
     if (Option.isNone(metadata)) return false;
     if (metadata.value.authorization_servers.length === 0) return false;
     return resourceMatchesEndpoint(metadata.value.resource, endpoint);
-  }).pipe(Effect.catch(() => Effect.succeed(false)));
+  }).pipe(
+    Effect.scoped,
+    Effect.catch(() => Effect.succeed(false)),
+  );
 
 const ErrorMessageShape = Schema.Struct({ message: Schema.String });
 const decodeErrorMessageShape = Schema.decodeUnknownOption(ErrorMessageShape);
@@ -407,9 +410,9 @@ export const probeMcpEndpointShape = (
         postRequest = HttpClientRequest.setHeader(postRequest, name, value);
       }
 
-      const postResponse = yield* client
-        .execute(postRequest)
-        .pipe(Effect.timeout(Duration.millis(timeoutMs)));
+      const postResponse = yield* executeWithinOrigin(client, postRequest).pipe(
+        Effect.timeout(Duration.millis(timeoutMs)),
+      );
 
       let initializeResult = yield* classify(postResponse, "POST");
 
@@ -420,9 +423,9 @@ export const probeMcpEndpointShape = (
         for (const [name, value] of Object.entries(options.headers ?? {})) {
           getRequest = HttpClientRequest.setHeader(getRequest, name, value);
         }
-        const getResponse = yield* client
-          .execute(getRequest)
-          .pipe(Effect.timeout(Duration.millis(timeoutMs)));
+        const getResponse = yield* executeWithinOrigin(client, getRequest).pipe(
+          Effect.timeout(Duration.millis(timeoutMs)),
+        );
         initializeResult = yield* classify(getResponse, "GET");
       }
 
@@ -453,13 +456,14 @@ export const probeMcpEndpointShape = (
       // The endpoint already answered the primary probe, so a transport
       // failure on this secondary request must not overwrite that verdict
       // with "unreachable" — keep the initialize classification instead.
-      const discoverResult = yield* client.execute(discoverRequest).pipe(
+      const discoverResult = yield* executeWithinOrigin(client, discoverRequest).pipe(
         Effect.timeout(Duration.millis(timeoutMs)),
         Effect.flatMap((discoverResponse) => classify(discoverResponse, "POST")),
         Effect.catch(() => Effect.succeed(null)),
       );
       return discoverResult ?? initializeResult;
     }).pipe(
+      Effect.scoped,
       Effect.provide(options.httpClientLayer ?? FetchHttpClient.layer),
       Effect.mapError(
         (cause) =>
