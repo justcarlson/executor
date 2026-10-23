@@ -142,6 +142,53 @@ describe("discoverProtectedResourceMetadata", () => {
   );
 });
 
+describe("discoverProtectedResourceMetadata challenge redirects", () => {
+  const challenge = (baseUrl: string) =>
+    HttpServerResponse.empty({
+      status: 401,
+      headers: { "www-authenticate": `Bearer resource_metadata="${baseUrl}/metadata"` },
+    });
+  const metadata = (baseUrl: string) =>
+    sendJson({ resource: `${baseUrl}/mcp`, authorization_servers: [baseUrl] });
+
+  it.effect("does not follow a cross-origin redirect with the resource query", () =>
+    withOAuthFixture(
+      (request, baseUrl) => (request.url === "/metadata" ? metadata(baseUrl) : challenge(baseUrl)),
+      (target) =>
+        withOAuthFixture(
+          (request) =>
+            request.url.startsWith("/mcp?")
+              ? HttpServerResponse.redirect(`${target.baseUrl}${request.url}`, { status: 302 })
+              : notFound(),
+          ({ baseUrl }) =>
+            Effect.gen(function* () {
+              const result = yield* discoverProtectedResourceMetadata(
+                `${baseUrl}/mcp?api_key=test-key-not-secret`,
+              );
+              expect(result).toBeNull();
+              expect(yield* target.requests).toEqual([]);
+            }),
+        ),
+    ),
+  );
+
+  it.effect("follows a same-origin redirect to the challenge", () =>
+    withOAuthFixture(
+      (request, baseUrl) => {
+        if (request.url === "/mcp") return HttpServerResponse.redirect("/mcp/", { status: 302 });
+        if (request.url === "/mcp/") return challenge(baseUrl);
+        if (request.url === "/metadata") return metadata(baseUrl);
+        return notFound();
+      },
+      ({ baseUrl }) =>
+        Effect.gen(function* () {
+          const result = yield* discoverProtectedResourceMetadata(`${baseUrl}/mcp`);
+          expect(result?.metadataUrl).toBe(`${baseUrl}/metadata`);
+        }),
+    ),
+  );
+});
+
 describe("discoverAuthorizationServerMetadata", () => {
   it.effect("falls back to openid-configuration when oauth-authorization-server is absent", () =>
     withOAuthFixture(

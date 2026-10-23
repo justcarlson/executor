@@ -531,6 +531,10 @@ export {
 // endpoint must strip its credential-bearing parts first.
 export { endpointForTelemetry, endpointTelemetryAttributes } from "./telemetry-endpoint";
 
+// Redirect handling for requests that carry caller-supplied credentials:
+// follow only within the endpoint origin, as the MCP SDK transport does.
+export { executeWithinOrigin } from "./within-origin-redirect";
+
 // URL redaction for exported telemetry — the shared scrub every exporter path
 // (cloud span processors, self-host and browser OTLP serialization, the
 // browser-traces forwarder) consumes.
