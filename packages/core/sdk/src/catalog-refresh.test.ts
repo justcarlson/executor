@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Clock, Deferred, Duration, Effect, Fiber, Option } from "effect";
+import { Clock, Deferred, Duration, Effect, Fiber, Option, Queue } from "effect";
 import { TestClock } from "effect/testing";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -93,13 +93,28 @@ const makeFixture = (
     return { executor, config, drain, expire, create, completions };
   });
 
+const makeReaderClock = Effect.gen(function* () {
+  const clock = yield* TestClock.make();
+  const parks = yield* Queue.unbounded<void>();
+  return {
+    clock: {
+      ...clock,
+      sleep: (duration: Duration.Duration) =>
+        Duration.toMillis(duration) === CATALOG_READER_WAIT_MS
+          ? Queue.offer(parks, undefined).pipe(Effect.andThen(clock.sleep(duration)))
+          : clock.sleep(duration),
+    },
+    parked: Queue.take(parks).pipe(Effect.timeout(10_000)),
+    advance: clock.adjust,
+  };
+});
+
 const makeHeldReaderFixture = (
   options: { readonly graceMs?: number; readonly incomplete?: boolean } = {},
 ) =>
   Effect.gen(function* () {
     const reading = yield* Deferred.make<void>();
     const secondReading = yield* Deferred.make<void>();
-    const discoveryStarted = yield* Deferred.make<void>();
     const releaseRead = yield* Deferred.make<void>();
     let holdRead = false;
     let readers = 0;
@@ -107,10 +122,9 @@ const makeHeldReaderFixture = (
     let refreshing = false;
     const fixture = yield* makeFixture(
       () =>
-        Effect.gen(function* () {
+        Effect.sync(() => {
           if (refreshing) {
             discoveries += 1;
-            yield* Deferred.succeed(discoveryStarted, undefined);
           }
           return refreshing && options.incomplete
             ? { tools: [], incomplete: true, incompleteReason: "fixture offline" }
@@ -149,7 +163,6 @@ const makeHeldReaderFixture = (
       before,
       reader,
       secondReading,
-      discoveryStarted,
       releaseRead,
       discoveries: () => discoveries,
       resumeReads: Effect.sync(() => {
@@ -180,23 +193,165 @@ describe("file-backed catalog refresh", () => {
       ),
   );
 
-  it.live("prioritizes cached reads but completes discovery while a reader never stops", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const fixture = yield* makeHeldReaderFixture();
-        expect(fixture.discoveries()).toBe(0);
-        yield* Deferred.await(fixture.discoveryStarted).pipe(
-          Effect.timeout(CATALOG_READER_WAIT_MS + 250),
-        );
-        yield* fixture.drain.pipe(Effect.timeout(CATALOG_READER_WAIT_MS * 3));
-        expect(fixture.discoveries()).toBe(1);
-        yield* Deferred.succeed(fixture.releaseRead, undefined);
-        expect(yield* Fiber.join(fixture.reader)).toEqual(fixture.before);
-        yield* fixture.resumeReads;
-        expect(yield* fixture.executor.tools.list()).toEqual(fixture.before);
-      }),
-    ),
-  );
+  for (const count of [1, 3]) {
+    it.live(
+      `bounds every reader park while refreshing ${count} queued connections`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const clock = yield* makeReaderClock;
+            const reading = yield* Deferred.make<void>();
+            const releaseRead = yield* Deferred.make<void>();
+            const discovered = yield* Queue.unbounded<string>();
+            const discoveries: string[] = [];
+            let refreshing = false;
+            let holdNextRead = false;
+            const fixture = yield* makeFixture(
+              (name) =>
+                Effect.gen(function* () {
+                  if (refreshing) {
+                    discoveries.push(name);
+                    yield* Queue.offer(discovered, name);
+                  }
+                  return catalog;
+                }),
+              {
+                readPolicy: Effect.gen(function* () {
+                  if (!holdNextRead) return;
+                  holdNextRead = false;
+                  yield* Deferred.succeed(reading, undefined);
+                  yield* Deferred.await(releaseRead);
+                }),
+              },
+            );
+            yield* Effect.addFinalizer(() =>
+              Deferred.succeed(releaseRead, undefined).pipe(
+                Effect.andThen(fixture.drain.pipe(Effect.timeout(10_000), Effect.orDie)),
+              ),
+            );
+            const names = Array.from({ length: count }, (_, index) => `connection${index}`);
+            for (const name of names) yield* fixture.create(name);
+            const before = yield* fixture.executor.tools.list();
+            yield* fixture.drain;
+            yield* fixture.expire;
+            refreshing = true;
+            holdNextRead = true;
+            const reader = yield* Effect.forkChild(
+              fixture.executor.tools.list().pipe(Effect.provideService(Clock.Clock, clock.clock)),
+            );
+            yield* Deferred.await(reading).pipe(Effect.timeout(10_000));
+            for (let index = 0; index < count; index += 1) {
+              yield* clock.parked;
+              expect(discoveries).toHaveLength(index);
+              const readAt = clock.clock.currentTimeMillisUnsafe();
+              expect(
+                yield* fixture.executor.tools
+                  .list()
+                  .pipe(Effect.provideService(Clock.Clock, clock.clock), Effect.timeout(10_000)),
+              ).toEqual(before);
+              expect(clock.clock.currentTimeMillisUnsafe()).toBe(readAt);
+              yield* clock.advance(CATALOG_READER_WAIT_MS - 1);
+              expect(discoveries).toHaveLength(index);
+              yield* clock.advance(1);
+              yield* Queue.take(discovered).pipe(Effect.timeout(10_000));
+              expect(discoveries).toHaveLength(index + 1);
+              for (let phase = 0; phase < 2; phase += 1) {
+                yield* clock.parked;
+                yield* clock.advance(CATALOG_READER_WAIT_MS);
+              }
+            }
+            yield* fixture.drain.pipe(Effect.timeout(10_000));
+            expect(discoveries.slice().sort()).toEqual(names);
+            const rows = yield* Effect.promise(() => fixture.config.db.findMany("connection", {}));
+            expect(rows.every((row) => Number(row.tools_synced_at) > 1)).toBe(true);
+            yield* Deferred.succeed(releaseRead, undefined);
+            expect(yield* Fiber.join(reader)).toEqual(before);
+          }),
+        ),
+      { timeout: 30_000 },
+    );
+  }
+
+  for (const trigger of ["stale-marked", "config-revised"] as const) {
+    it.live(
+      `queues ${trigger} work with zero grace`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const clock = yield* makeReaderClock;
+            const reading = yield* Deferred.make<void>();
+            const releaseRead = yield* Deferred.make<void>();
+            const started = yield* Deferred.make<void>();
+            const releaseDiscovery = yield* Deferred.make<void>();
+            let refreshing = false;
+            let holdRead = false;
+            const discoveries: string[] = [];
+            const fixture = yield* makeFixture(
+              (name) =>
+                Effect.gen(function* () {
+                  if (refreshing) {
+                    discoveries.push(name);
+                    yield* Deferred.succeed(started, undefined);
+                    yield* Deferred.await(releaseDiscovery);
+                  }
+                  return catalog;
+                }),
+              {
+                graceMs: 0,
+                readPolicy: Effect.gen(function* () {
+                  if (!holdRead) return;
+                  yield* Deferred.succeed(reading, undefined);
+                  yield* Deferred.await(releaseRead);
+                }),
+              },
+            );
+            yield* Effect.addFinalizer(() =>
+              Deferred.succeed(releaseRead, undefined).pipe(
+                Effect.andThen(Deferred.succeed(releaseDiscovery, undefined)),
+                Effect.andThen(fixture.drain.pipe(Effect.timeout(10_000), Effect.orDie)),
+              ),
+            );
+            for (const name of ["a", "b"]) yield* fixture.create(name);
+            const before = yield* fixture.executor.tools.list();
+            yield* fixture.drain;
+            yield* Effect.promise(() =>
+              fixture.config.db.updateMany("connection", {
+                set:
+                  trigger === "stale-marked"
+                    ? { tools_synced_at: null }
+                    : { tools_synced_at: Date.now() - 1000 },
+              }),
+            );
+            if (trigger === "config-revised") {
+              yield* Effect.promise(() =>
+                fixture.config.db.updateMany("integration", {
+                  set: { config_revised_at: Date.now() },
+                }),
+              );
+            }
+            refreshing = true;
+            holdRead = true;
+            const reader = yield* Effect.forkChild(
+              fixture.executor.tools.list().pipe(Effect.provideService(Clock.Clock, clock.clock)),
+            );
+            yield* Deferred.await(reading).pipe(Effect.timeout(10_000));
+            yield* clock.parked;
+            expect(discoveries).toEqual([]);
+            yield* clock.advance(CATALOG_READER_WAIT_MS - 1);
+            expect(discoveries).toEqual([]);
+            yield* clock.advance(1);
+            yield* Deferred.await(started).pipe(Effect.timeout(10_000));
+            expect(discoveries).toHaveLength(1);
+            yield* Deferred.succeed(releaseRead, undefined);
+            expect(yield* Fiber.join(reader)).toEqual(before);
+            yield* Deferred.succeed(releaseDiscovery, undefined);
+            yield* fixture.drain.pipe(Effect.timeout(10_000));
+            expect(discoveries.slice().sort()).toEqual(["a", "b"]);
+          }),
+        ),
+      { timeout: 30_000 },
+    );
+  }
 
   it.live("lets an explicit refresh join reader-deferred discovery and retain full schemas", () =>
     Effect.scoped(
@@ -443,96 +598,104 @@ describe("file-backed catalog refresh", () => {
     { timeout: 30_000 },
   );
 
-  it.live("settles every queued batch when a shared discovery is interrupted", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const started = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const interrupted = yield* Deferred.make<void>();
-        let refreshing = false;
-        let first: string | undefined;
-        const discoveries: string[] = [];
-        const fixture = yield* makeFixture((name) =>
-          Effect.gen(function* () {
-            if (!refreshing) return catalog;
-            discoveries.push(name);
-            if (first === undefined) first = name;
-            if (name === first) {
-              yield* Deferred.succeed(started, undefined);
-              yield* Deferred.await(release);
-              return catalog;
-            }
-            yield* Deferred.succeed(interrupted, undefined);
-            return yield* Effect.interrupt;
-          }),
-        );
-        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
-        yield* fixture.create("a");
-        yield* fixture.create("b");
-        yield* fixture.expire;
-        refreshing = true;
-        yield* fixture.executor.tools.list();
-        yield* Deferred.await(started).pipe(Effect.timeout(2000));
-        yield* fixture.executor.tools.list();
-        expect(fixture.completions).toHaveLength(4);
-        yield* Deferred.succeed(release, undefined);
-        yield* Deferred.await(interrupted).pipe(Effect.timeout(2000));
-        expect(Option.isSome(yield* fixture.drain.pipe(Effect.timeoutOption(2000)))).toBe(true);
-        expect(discoveries.slice().sort()).toEqual(["a", "b"]);
-      }),
-    ),
+  it.live(
+    "settles every queued batch when a shared discovery is interrupted",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const started = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const interrupted = yield* Deferred.make<void>();
+          let refreshing = false;
+          let first: string | undefined;
+          const discoveries: string[] = [];
+          const fixture = yield* makeFixture(
+            (name) =>
+              Effect.gen(function* () {
+                if (!refreshing) return catalog;
+                discoveries.push(name);
+                if (first === undefined) first = name;
+                if (name === first) {
+                  yield* Deferred.succeed(started, undefined);
+                  yield* Deferred.await(release);
+                  return catalog;
+                }
+                yield* Deferred.succeed(interrupted, undefined);
+                return yield* Effect.interrupt;
+              }),
+            { graceMs: 10_000 },
+          );
+          yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+          yield* fixture.create("a");
+          yield* fixture.create("b");
+          yield* fixture.expire;
+          refreshing = true;
+          yield* fixture.executor.tools.list();
+          yield* Deferred.await(started).pipe(Effect.timeout(10_000));
+          yield* fixture.executor.tools.list();
+          expect(fixture.completions).toHaveLength(4);
+          yield* Deferred.succeed(release, undefined);
+          yield* Deferred.await(interrupted).pipe(Effect.timeout(10_000));
+          expect(Option.isSome(yield* fixture.drain.pipe(Effect.timeoutOption(10_000)))).toBe(true);
+          expect(discoveries.slice().sort()).toEqual(["a", "b"]);
+        }),
+      ),
+    { timeout: 30_000 },
   );
 
-  it.live("discovers newly stale connections while an urgent discovery is held", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const started = yield* Deferred.make<void>();
-        const release = yield* Deferred.make<void>();
-        const discoveredB = yield* Deferred.make<void>();
-        let refreshing = false;
-        const discoveries: string[] = [];
-        const fixture = yield* makeFixture(
-          (name) =>
-            Effect.gen(function* () {
-              if (!refreshing) return catalog;
-              discoveries.push(name);
-              if (name === "a") {
-                yield* Deferred.succeed(started, undefined);
-                yield* Deferred.await(release);
-              } else {
-                yield* Deferred.succeed(discoveredB, undefined);
-              }
-              return { tools: [{ name: ToolName.make("updated") }] };
+  it.live(
+    "discovers newly stale connections while an urgent discovery is held",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const started = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const discoveredB = yield* Deferred.make<void>();
+          let refreshing = false;
+          const discoveries: string[] = [];
+          const fixture = yield* makeFixture(
+            (name) =>
+              Effect.gen(function* () {
+                if (!refreshing) return catalog;
+                discoveries.push(name);
+                if (name === "a") {
+                  yield* Deferred.succeed(started, undefined);
+                  yield* Deferred.await(release);
+                } else {
+                  yield* Deferred.succeed(discoveredB, undefined);
+                }
+                return { tools: [{ name: ToolName.make("updated") }] };
+              }),
+            { graceMs: 50 },
+          );
+          yield* Effect.addFinalizer(() =>
+            Deferred.succeed(release, undefined).pipe(Effect.andThen(fixture.drain)),
+          );
+          yield* fixture.create("a");
+          yield* fixture.create("b");
+          refreshing = true;
+          yield* Effect.promise(() =>
+            fixture.config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "a"),
+              set: { tools_synced_at: null },
             }),
-          { graceMs: 50 },
-        );
-        yield* Effect.addFinalizer(() =>
-          Deferred.succeed(release, undefined).pipe(Effect.andThen(fixture.drain)),
-        );
-        yield* fixture.create("a");
-        yield* fixture.create("b");
-        refreshing = true;
-        yield* Effect.promise(() =>
-          fixture.config.db.updateMany("connection", {
-            where: (b) => b("name", "=", "a"),
-            set: { tools_synced_at: null },
-          }),
-        );
-        yield* fixture.executor.tools.list();
-        yield* Deferred.await(started).pipe(Effect.timeout(2000));
-        yield* Effect.promise(() =>
-          fixture.config.db.updateMany("connection", {
-            where: (b) => b("name", "=", "b"),
-            set: { tools_synced_at: null },
-          }),
-        );
-        yield* fixture.executor.tools.list();
-        expect(
-          Option.isSome(yield* Deferred.await(discoveredB).pipe(Effect.timeoutOption(2000))),
-        ).toBe(true);
-        expect(discoveries.slice().sort()).toEqual(["a", "b"]);
-      }),
-    ),
+          );
+          yield* fixture.executor.tools.list();
+          yield* Deferred.await(started).pipe(Effect.timeout(10_000));
+          yield* Effect.promise(() =>
+            fixture.config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "b"),
+              set: { tools_synced_at: null },
+            }),
+          );
+          yield* fixture.executor.tools.list();
+          expect(
+            Option.isSome(yield* Deferred.await(discoveredB).pipe(Effect.timeoutOption(10_000))),
+          ).toBe(true);
+          expect(discoveries.slice().sort()).toEqual(["a", "b"]);
+        }),
+      ),
+    { timeout: 30_000 },
   );
 
   it.live("keeps identical tool and definition rows while reads overlap reordered discovery", () =>
