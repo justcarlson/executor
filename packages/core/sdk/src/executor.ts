@@ -3896,8 +3896,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const existing = toolProductionInFlight.get(key);
         if (existing) {
           if (requestedMode === "explicit") existing.mode = "explicit";
-          else if (requestedMode === "background" && existing.mode === "detached")
-            existing.mode = "background";
           return requestedMode === "detached"
             ? Effect.succeed([])
             : Deferred.succeed(existing.foreground, undefined).pipe(
