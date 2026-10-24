@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Fiber, Option } from "effect";
+import { Clock, Deferred, Duration, Effect, Fiber, Option } from "effect";
+import { TestClock } from "effect/testing";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -355,6 +356,86 @@ describe("file-backed catalog refresh", () => {
           yield* Deferred.await(discoveredA).pipe(Effect.timeout(10_000));
           yield* fixture.drain.pipe(Effect.timeout(10_000));
           expect(discoveries.filter((name) => name === "a")).toHaveLength(1);
+        }),
+      ),
+    { timeout: 30_000 },
+  );
+
+  it.live(
+    "preserves a health verdict written while detached persistence is parked",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const started = yield* Deferred.make<void>();
+          const releaseDiscovery = yield* Deferred.make<void>();
+          const reading = yield* Deferred.make<void>();
+          const releaseRead = yield* Deferred.make<void>();
+          const parked = yield* Deferred.make<void>();
+          const clock = yield* TestClock.make();
+          let refreshing = false;
+          let holdRead = false;
+          let observePark = false;
+          const fixture = yield* makeFixture(
+            () =>
+              Effect.gen(function* () {
+                if (refreshing) {
+                  yield* Deferred.succeed(started, undefined);
+                  yield* Deferred.await(releaseDiscovery);
+                }
+                return catalog;
+              }),
+            {
+              readPolicy: Effect.gen(function* () {
+                if (!holdRead) return;
+                yield* Deferred.succeed(reading, undefined);
+                yield* Deferred.await(releaseRead);
+              }),
+            },
+          );
+          yield* Effect.addFinalizer(() =>
+            Deferred.succeed(releaseDiscovery, undefined).pipe(
+              Effect.andThen(Deferred.succeed(releaseRead, undefined)),
+              Effect.andThen(fixture.drain.pipe(Effect.timeout(10_000), Effect.orDie)),
+            ),
+          );
+          yield* fixture.create("main");
+          yield* Effect.promise(() =>
+            fixture.config.db.updateMany("connection", {
+              set: {
+                tools_synced_at: 1,
+                updated_at: new Date(0),
+                last_health: { status: "degraded", checkedAt: 1, reason: "tool_sync_failed" },
+              },
+            }),
+          );
+          refreshing = true;
+          yield* fixture.executor.tools.list().pipe(
+            Effect.provideService(Clock.Clock, {
+              ...clock,
+              sleep: (duration) =>
+                observePark && Duration.toMillis(duration) === 1000
+                  ? Deferred.succeed(parked, undefined).pipe(Effect.andThen(clock.sleep(duration)))
+                  : clock.sleep(duration),
+            }),
+          );
+          yield* Deferred.await(started).pipe(Effect.timeout(10_000));
+          holdRead = true;
+          const reader = yield* Effect.forkChild(fixture.executor.tools.list());
+          yield* Deferred.await(reading).pipe(Effect.timeout(10_000));
+          observePark = true;
+          yield* Deferred.succeed(releaseDiscovery, undefined);
+          yield* Deferred.await(parked).pipe(Effect.timeout(10_000));
+          const verdict = { status: "expired", checkedAt: 2, detail: "HTTP 401" };
+          yield* Effect.promise(() =>
+            fixture.config.db.updateMany("connection", {
+              set: { last_health: verdict, updated_at: new Date(1000) },
+            }),
+          );
+          yield* Deferred.succeed(releaseRead, undefined);
+          yield* Fiber.join(reader);
+          yield* fixture.drain.pipe(Effect.timeout(10_000));
+          const rows = yield* Effect.promise(() => fixture.config.db.findMany("connection", {}));
+          expect(rows[0]?.last_health).toEqual(verdict);
         }),
       ),
     { timeout: 30_000 },

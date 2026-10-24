@@ -3618,7 +3618,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // preserving genuine health-check outcomes.
         const stampSynced = (row: ConnectionRow | null) =>
           core.updateMany("connection", {
-            where: connectionWhere,
+            where: (b: AnyCb) =>
+              b.and(connectionWhere(b), row === null ? true : b("updated_at", "=", row.updated_at)),
             set: syncedSet(row),
           });
         // A failing sync must not bury a recorded dead grant's `expired`
