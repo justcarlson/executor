@@ -176,8 +176,11 @@ const withStandaloneStreamKeepalive = (response: Response, signal: AbortSignal):
     signal.removeEventListener("abort", clearPing);
   };
   const encoder = new TextEncoder();
-  const transformer = {
-    start: (controller: TransformStreamDefaultController<Uint8Array>) => {
+  // Bun 1.3.11 skips TransformStream cancel on client disconnect, leaving the ping timer alive.
+  // A ReadableStream source cancel hook does run.
+  const reader = response.body.getReader();
+  const stream = new ReadableStream<Uint8Array>({
+    start: (controller) => {
       // A first chunk lets HTTP servers flush the SSE headers before any event.
       controller.enqueue(encoder.encode(": connected\n\n"));
       if (signal.aborted) return;
@@ -186,13 +189,27 @@ const withStandaloneStreamKeepalive = (response: Response, signal: AbortSignal):
         controller.enqueue(encoder.encode(": ping\n\n"));
       }, STREAM_KEEPALIVE_INTERVAL_MS);
     },
-    flush: clearPing,
-    cancel: clearPing,
-  };
-  return new Response(
-    response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(transformer)),
-    response,
-  );
+    pull: (controller) =>
+      reader.read().then(
+        ({ done, value }) => {
+          if (done) {
+            clearPing();
+            controller.close();
+          } else {
+            controller.enqueue(value);
+          }
+        },
+        (error: unknown) => {
+          clearPing();
+          controller.error(error);
+        },
+      ),
+    cancel: (reason) => {
+      clearPing();
+      return reader.cancel(reason);
+    },
+  });
+  return new Response(stream, response);
 };
 
 const formatBoundaryError = (error: unknown): unknown =>
