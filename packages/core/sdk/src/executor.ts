@@ -1241,6 +1241,24 @@ const rowToTool = (
   };
 };
 
+// Database row order is unspecified. Names are unique within a connection.
+const catalogRowsMatch = <Row extends { readonly name: string }>(
+  stored: readonly Row[],
+  proposed: readonly Row[],
+  columns: readonly (keyof Row)[],
+): boolean => {
+  if (stored.length !== proposed.length) return false;
+  const byName = new Map(proposed.map((row) => [row.name, row]));
+  return stored.every((row) => {
+    const candidate = byName.get(row.name);
+    return (
+      candidate !== undefined &&
+      JSON.stringify(columns.map((column) => row[column])) ===
+        JSON.stringify(columns.map((column) => candidate[column]))
+    );
+  });
+};
+
 // Projects a tool's annotations onto the schema view. Plugins persist extra
 // keys alongside the declared contract (the mcp plugin stores its upstream tool
 // name and `_meta` there so they survive to invokeTool), so the three declared
@@ -3760,6 +3778,30 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         yield* persistCatalog(
           Effect.gen(function* () {
+            const toolColumns = [
+              "plugin_id",
+              "name",
+              "description",
+              "input_schema",
+              "output_schema",
+              "annotations",
+            ] as const;
+            const definitionColumns = ["plugin_id", "name", "schema"] as const;
+            const storedTools = yield* core.findMany("tool", { where, select: toolColumns });
+            const storedDefinitions = yield* core.findMany("definition", {
+              where,
+              select: definitionColumns,
+            });
+            const unchanged = yield* Effect.try({
+              try: () =>
+                catalogRowsMatch(storedTools, toolRows, toolColumns) &&
+                catalogRowsMatch(storedDefinitions, definitionRows, definitionColumns),
+              catch: (cause) => storageFailureFromUnknown("comparing tool catalog", cause),
+            });
+            if (unchanged) {
+              yield* stampSynced(existingRow);
+              return;
+            }
             yield* core.deleteMany("tool", { where });
             yield* core.deleteMany("definition", { where });
             yield* core.createMany("tool", toolRows);
@@ -5583,6 +5625,40 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const toolsSyncTtlMs =
       config.toolsSyncTtlMs === undefined ? DEFAULT_TOOLS_SYNC_TTL_MS : config.toolsSyncTtlMs;
 
+    const detachedToolSyncLock = Semaphore.makeUnsafe(1);
+    const queuedToolSyncs = new Map<string, Deferred.Deferred<void, StorageFailure>>();
+    const queueDetachedToolSync = (
+      connection: ConnectionRow,
+      ref: ConnectionRef,
+      rebuild: Effect.Effect<readonly Tool[]>,
+    ) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const key = `${ref.owner}:${String(ref.integration)}:${String(ref.name)}`;
+          const queued = queuedToolSyncs.get(key);
+          if (queued) return yield* restore(Deferred.await(queued));
+          const done = Deferred.makeUnsafe<void, StorageFailure>();
+          queuedToolSyncs.set(key, done);
+          const run = detachedToolSyncLock.withPermits(1)(
+            Effect.gen(function* () {
+              // A scan can hold an old row after another refresh has finished.
+              // Explicit and urgent refreshes also bypass this queue.
+              const fresh = yield* findConnectionRow(ref);
+              if (fresh === null || fresh.tools_synced_at !== connection.tools_synced_at) return;
+              yield* rebuild;
+            }),
+          );
+          yield* Effect.forkDetach(
+            restore(run).pipe(
+              Effect.exit,
+              Effect.flatMap((exit) => Deferred.done(done, exit)),
+              Effect.ensuring(Effect.sync(() => void queuedToolSyncs.delete(key))),
+            ),
+          );
+          yield* restore(Deferred.await(done));
+        }),
+      );
+
     // Rebuild any visible connection whose persisted tool catalog is stale.
     // Three triggers:
     //  - stale-marked: `tools_synced_at` is NULL (`connections.markToolsStale`
@@ -5658,7 +5734,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // persisted rows at once. Without that split every read after the TTL
         // paid the grace budget for MCP listings it had no reason to wait on.
         const urgent: Effect.Effect<readonly Tool[]>[] = [];
-        const deferred: Effect.Effect<readonly Tool[]>[] = [];
+        const deferred: Effect.Effect<void>[] = [];
         for (const connection of connections) {
           const integrationRow = integrationBySlug.get(connection.integration);
           if (!integrationRow) continue;
@@ -5685,40 +5761,50 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             syncedAt < cutoff;
           if (!staleMarked && !configRevised && !expired) continue;
 
-          (staleMarked || configRevised || mode === "converge" ? urgent : deferred).push(
-            produceConnectionTools(
-              integrationRow,
-              {
-                owner: connection.owner as Owner,
-                integration: IntegrationSlug.make(connection.integration),
-                name: ConnectionName.make(connection.name),
-              },
-              "background",
-            ).pipe(
-              // Best-effort, but never silent: the read still succeeds on the
-              // stale-but-working catalog and the peer rebuilds still finish,
-              // while the operator gets the connection that failed and why.
-              // Without this a connection whose upstream is permanently broken
-              // re-fails on every read and leaves no trace anywhere.
-              Effect.catch((error) =>
-                Effect.logWarning("executor stale tool sync failed", {
-                  integration: connection.integration,
-                  connection: connection.name,
-                  error: describeSyncFailure(error),
-                }).pipe(Effect.as([] as readonly Tool[])),
-              ),
-              Effect.withSpan("executor.tools.sync_stale", {
-                attributes: {
-                  "executor.integration": connection.integration,
-                  "executor.connection": connection.name,
-                },
-              }),
+          const ref: ConnectionRef = {
+            owner: connection.owner as Owner,
+            integration: IntegrationSlug.make(connection.integration),
+            name: ConnectionName.make(connection.name),
+          };
+          const rebuild = produceConnectionTools(integrationRow, ref, "background").pipe(
+            // Best-effort, but never silent: the read still succeeds on the
+            // stale-but-working catalog and the peer rebuilds still finish,
+            // while the operator gets the connection that failed and why.
+            // Without this a connection whose upstream is permanently broken
+            // re-fails on every read and leaves no trace anywhere.
+            Effect.catch((error) =>
+              Effect.logWarning("executor stale tool sync failed", {
+                integration: connection.integration,
+                connection: connection.name,
+                error: describeSyncFailure(error),
+              }).pipe(Effect.as([] as readonly Tool[])),
             ),
+            Effect.withSpan("executor.tools.sync_stale", {
+              attributes: {
+                "executor.integration": connection.integration,
+                "executor.connection": connection.name,
+              },
+            }),
           );
+          if (mode === "converge" || ((staleMarked || configRevised) && toolsSyncGraceMs !== 0)) {
+            urgent.push(rebuild);
+          } else {
+            deferred.push(
+              queueDetachedToolSync(connection, ref, rebuild).pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning("executor detached tool sync failed", {
+                    integration: connection.integration,
+                    connection: connection.name,
+                    error: describeSyncFailure(error),
+                  }),
+                ),
+              ),
+            );
+          }
         }
         if (deferred.length > 0) {
           const background = yield* Effect.forkDetach(
-            Effect.all(deferred, { concurrency: STALE_TOOLS_SYNC_CONCURRENCY }),
+            Effect.all(deferred, { concurrency: "unbounded" }),
           );
           config.waitUntil?.(
             new Promise<void>((resolve) => background.addObserver(() => resolve(undefined))),
@@ -5745,24 +5831,34 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // failures log and the stale-but-working catalog stays — so the fork
     // swallows its scan errors the same way each rebuild already swallows its
     // own.
-    const startStaleSync = Effect.gen(function* () {
-      const fiber = yield* Effect.forkDetach(
-        syncStaleConnectionTools("bounded").pipe(
-          Effect.catch((error) =>
-            Effect.logWarning("executor stale tool sync scan failed", {
-              error: describeSyncFailure(error),
-            }),
+    let staleSyncFiber: Fiber.Fiber<void> | null = null;
+    const startStaleSync = Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (staleSyncFiber !== null) return staleSyncFiber;
+        const fiber = yield* Effect.forkDetach(
+          restore(syncStaleConnectionTools("bounded")).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                staleSyncFiber = null;
+              }),
+            ),
+            Effect.catch((error) =>
+              Effect.logWarning("executor stale tool sync scan failed", {
+                error: describeSyncFailure(error),
+              }),
+            ),
           ),
-        ),
-      );
-      // On hosts that cancel request-scoped I/O once the response settles
-      // (Cloudflare Workers), hand the host the rebuilds' completion so the
-      // catalog still converges after the read stops waiting.
-      config.waitUntil?.(
-        new Promise<void>((resolve) => fiber.addObserver(() => resolve(undefined))),
-      );
-      return fiber;
-    });
+        );
+        staleSyncFiber = fiber;
+        // On hosts that cancel request-scoped I/O once the response settles
+        // (Cloudflare Workers), hand the host the rebuilds' completion so the
+        // catalog still converges after the read stops waiting.
+        config.waitUntil?.(
+          new Promise<void>((resolve) => fiber.addObserver(() => resolve(undefined))),
+        );
+        return fiber;
+      }),
+    );
 
     // Restrict a tool-row read to the prefixes an allowlist policy source can
     // reach. `null` = no restriction; `false` = nothing reachable, skip the
