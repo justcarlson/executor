@@ -3629,17 +3629,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               }
             : { tools_synced_at: Date.now() };
         };
-        // Every exit stamps the sync time — including the cleanup paths that
-        // produce zero tools — so the stale-catalog check (`config_revised_at`
-        // vs `tools_synced_at`) doesn't re-attempt this connection per read.
-        // Successful syncs also clear stale sync-failure health records, while
-        // preserving genuine health-check outcomes.
-        const stampSynced = (row: ConnectionRow | null) =>
-          core.updateMany("connection", {
-            where: (b: AnyCb) =>
-              b.and(connectionWhere(b), row === null ? true : b("updated_at", "=", row.updated_at)),
-            set: syncedSet(row),
-          });
+        // Every successful exit stamps the sync time, including cleanup paths,
+        // so the next read does not repeat discovery after another row write.
+        // Read health inside persistence so discovery and reader parks cannot
+        // hide a newer verdict. No timestamp comparison can skip the stamp.
+        const stampSynced = () =>
+          findConnectionRow(ref).pipe(
+            Effect.flatMap((fresh) =>
+              core.updateMany("connection", {
+                where: connectionWhere,
+                set: syncedSet(fresh),
+              }),
+            ),
+          );
         // A failing sync must not bury a recorded dead grant's `expired`
         // verdict: this sync's own credential resolution is what discovers
         // invalid_grant (refresh → recorder), so by failure time the row
@@ -3717,7 +3719,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             Effect.gen(function* () {
               yield* core.deleteMany("tool", { where });
               yield* core.deleteMany("definition", { where });
-              yield* stampSynced(existingRow);
+              yield* stampSynced();
             }),
           );
           return [];
@@ -3729,7 +3731,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             Effect.gen(function* () {
               yield* core.deleteMany("tool", { where });
               yield* core.deleteMany("definition", { where });
-              yield* stampSynced(existingRow);
+              yield* stampSynced();
             }),
           );
           return [];
@@ -3844,14 +3846,14 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               catch: (cause) => storageFailureFromUnknown("comparing tool catalog", cause),
             });
             if (unchanged) {
-              yield* stampSynced(existingRow);
+              yield* stampSynced();
               return;
             }
             yield* core.deleteMany("tool", { where });
             yield* core.deleteMany("definition", { where });
             yield* core.createMany("tool", toolRows);
             yield* core.createMany("definition", definitionRows);
-            yield* stampSynced(existingRow);
+            yield* stampSynced();
           }),
         );
 
