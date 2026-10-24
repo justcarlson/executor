@@ -1,7 +1,12 @@
 import { Effect, Layer } from "effect";
 
 import { AccountProvider, type AccountHeaders } from "@executor-js/api/server";
-import { AccountError, AccountNoOrganization, AccountUnauthorized } from "@executor-js/api";
+import {
+  AccountError,
+  AccountNoOrganization,
+  AccountUnauthorized,
+  AccountUnavailable,
+} from "@executor-js/api";
 
 import { BetterAuth } from "../auth/better-auth";
 import { findInstanceMembership } from "../auth/membership";
@@ -47,13 +52,9 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           catch: () => new AccountError({ message: "Failed to resolve session" }),
         }).pipe(Effect.orElseSucceed(() => null));
 
-      // The account plane acts as the calling user with their own headers, so
-      // Better Auth answers for any user with a live session — including one
-      // whose membership was removed. Every self-serve route first requires a
-      // CURRENT member row in the instance org (../auth/membership.ts): no
-      // session is 401, a session without membership is 403. The member
-      // management routes below are gated by the organization plugin itself,
-      // which refuses callers who are not members of the org.
+      // Native Better Auth routes can mint credentials without a membership
+      // check. Every use of a credential is checked for current membership.
+      // These account routes also check membership before managing API keys.
       const requireMember = (headers: AccountHeaders) =>
         Effect.gen(function* () {
           const resolved = yield* getSession(headers);
@@ -62,6 +63,10 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
             betterAuth,
             resolved.user.id,
             resolved.session.activeOrganizationId ?? organizationId,
+          ).pipe(
+            Effect.mapError(
+              () => new AccountUnavailable({ message: "Membership lookup unavailable" }),
+            ),
           );
           if (!membership) return yield* new AccountNoOrganization();
           return resolved;

@@ -1,6 +1,6 @@
 import { Effect, Layer } from "effect";
 
-import { IdentityProvider } from "@executor-js/api/server";
+import { IdentityProvider, type Unavailable } from "@executor-js/api/server";
 import type {
   McpAuthProvider,
   McpErrorReporter,
@@ -87,7 +87,7 @@ type BetterAuthSession = NonNullable<
 const principalFromSession = (
   resolved: BetterAuthSession,
   betterAuth: BetterAuthHandle,
-): Effect.Effect<Principal | null> => {
+): Effect.Effect<Principal | null, Unavailable> => {
   const organizationId = resolved.session.activeOrganizationId ?? betterAuth.organizationId;
   // A session names a user; the member row names a member. A removed member's
   // session must not reach a paused execution or record an approval decision.
@@ -132,13 +132,22 @@ const makeApprovalHandler =
       }).pipe(Effect.orElseSucceed(() => null)),
     );
     if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
-    const principal = await Effect.runPromise(principalFromSession(session, betterAuth));
-    if (!principal) return jsonResponse({ error: "Forbidden" }, 403);
-
-    return (
-      (await store.handlePausedRequest(request, principal)) ??
-      (await store.handleApprovalRequest(request, principal)) ??
-      jsonResponse({ error: "Not found" }, 404)
+    return Effect.runPromise(
+      principalFromSession(session, betterAuth).pipe(
+        Effect.flatMap((principal) =>
+          principal
+            ? Effect.promise(
+                async () =>
+                  (await store.handlePausedRequest(request, principal)) ??
+                  (await store.handleApprovalRequest(request, principal)) ??
+                  jsonResponse({ error: "Not found" }, 404),
+              )
+            : Effect.succeed(jsonResponse({ error: "Forbidden" }, 403)),
+        ),
+        Effect.catchTag("Unavailable", () =>
+          Effect.succeed(jsonResponse({ error: "Membership lookup unavailable" }, 503)),
+        ),
+      ),
     );
   };
 

@@ -12,9 +12,8 @@
 //   - `AuthContext`      — the one Context.Service handlers read (carries roles;
 //                          cloud's old tag lacked them, forward-compatible).
 //   - `Unauthorized` /   — the shared error set (httpApiStatus 401 / 403 / 503),
-//     `NoOrganization` /   shared by every consumer in both apps. Self-host only
-//     `Unavailable`        ever produces the first two; cloud also produces
-//                          `Unavailable` (503) when api-key validation is down.
+//     `NoOrganization` /   shared by every consumer in both apps. Transient
+//     `Unavailable`        credential or membership lookup failures use 503.
 //   - `IdentityProvider` — the swap seam: `authenticate(request) =>
 //                          Effect<Principal, Unauthorized | NoOrganization |
 //                          Unavailable>`.
@@ -176,10 +175,8 @@ export class NoOrganization extends Schema.TaggedErrorClass<NoOrganization>()(
 ) {}
 
 /**
- * The credential could not be validated for a transient reason (cloud's api-key
- * validation backend is down). Renders 503 — the caller should retry. Self-host
- * never produces this; it is part of the shared set so cloud provides the SAME
- * neutral `IdentityProvider` tag without a wider error channel.
+ * Credential validation or membership lookup failed temporarily. Renders 503
+ * so the caller can retry with the same credential.
  */
 export class Unavailable extends Schema.TaggedErrorClass<Unavailable>()(
   "Unavailable",

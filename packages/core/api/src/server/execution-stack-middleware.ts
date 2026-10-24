@@ -19,8 +19,8 @@
 //                          impl.
 //   - `renderFailure`    — the failure-rendering strategy. Cloud renders the
 //                          shared errors as its exact `{ error, code }` JSON at
-//                          401/403/503; self-host catches them into 401/403/503
-//                          text. The seam (request -> Principal | shared error) is
+//                          401/403/503; self-host uses text for 401/403 and JSON
+//                          for 503. The seam (request -> Principal | shared error) is
 //                          identical; only the rendering differs.
 //   - `plugins`          — the host's plugin tuple (typed extension Services).
 //   - `stackLayer`       — the host's `makeExecutionStack` seam Layer (cloud:
@@ -81,10 +81,9 @@ export interface FailureRenderingStrategy<E, RR = never> {
 
 /**
  * Self-host's strategy: this is an `HttpRouter` middleware (not an `HttpApi`
- * endpoint), so a failed typed error would surface as a 500 — recover
- * `Unauthorized` -> 401 text and `NoOrganization` -> 403 text instead. Self-host
- * never produces `Unavailable`, but the shared channel now includes it, so it is
- * recovered to a 503 text for total coverage.
+ * endpoint), so a failed typed error would surface as a 500. Recover
+ * `Unauthorized` to 401 text and `NoOrganization` to 403 text. Self-host
+ * recovers `Unavailable` to 503 JSON so transient lookup failures can be retried.
  */
 export const textFailureStrategy: FailureRenderingStrategy<IdentityFailure> = {
   renderFailure: (effect) =>
@@ -100,9 +99,12 @@ export const textFailureStrategy: FailureRenderingStrategy<IdentityFailure> = {
           ),
         Unavailable: () =>
           Effect.succeed(
-            HttpServerResponse.text("Authentication temporarily unavailable", {
-              status: 503,
-            }),
+            HttpServerResponse.jsonUnsafe(
+              { error: "Authentication temporarily unavailable" },
+              {
+                status: 503,
+              },
+            ),
           ),
         // Self-host/local identity never resolves a platform credential, but the
         // method gate raises this tag on the SHARED channel, so total coverage

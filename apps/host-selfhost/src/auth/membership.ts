@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Data, Effect } from "effect";
 
 import { isPrivileged } from "../admin/require-admin";
 import type { BetterAuthHandle } from "./better-auth";
@@ -28,28 +28,30 @@ export interface InstanceMembership {
   readonly role: InstanceOrgRole;
 }
 
-/**
- * The caller's current membership in the instance organization, or `null`
- * when there is none. A lookup failure also answers `null`: every caller
- * treats `null` as a denial, so an infrastructure fault refuses the request
- * rather than admitting it.
- */
+export class MembershipLookupFailed extends Data.TaggedError("MembershipLookupFailed")<{
+  readonly cause: unknown;
+}> {}
+
+/** Returns null only when the caller has no membership row. */
 export const findInstanceMembership = (
   betterAuth: BetterAuthHandle,
   userId: string,
   organizationId: string,
-): Effect.Effect<InstanceMembership | null> =>
-  Effect.tryPromise(async () => {
-    const context = await betterAuth.auth.$context;
-    return context.adapter.findOne<{ readonly role?: string | null }>({
-      model: "member",
-      where: [
-        { field: "userId", value: userId },
-        { field: "organizationId", value: organizationId },
-      ],
-    });
+): Effect.Effect<InstanceMembership | null, MembershipLookupFailed> =>
+  Effect.tryPromise({
+    try: async () => {
+      const context = await betterAuth.auth.$context;
+      return context.adapter.findOne<{ readonly role?: string | null }>({
+        model: "member",
+        where: [
+          { field: "userId", value: userId },
+          { field: "organizationId", value: organizationId },
+        ],
+      });
+    },
+    catch: (cause) => new MembershipLookupFailed({ cause }),
   }).pipe(
-    Effect.orElseSucceed(() => null),
+    Effect.tapError((error) => Effect.logError(error)),
     Effect.map((row): InstanceMembership | null =>
       row ? { role: row.role != null && isPrivileged(row.role) ? "admin" : "member" } : null,
     ),

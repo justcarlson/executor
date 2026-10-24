@@ -1,6 +1,11 @@
 import { Effect, Layer } from "effect";
 
-import { IdentityProvider, NoOrganization, Unauthorized } from "@executor-js/api/server";
+import {
+  IdentityProvider,
+  NoOrganization,
+  Unauthorized,
+  Unavailable,
+} from "@executor-js/api/server";
 
 import { BetterAuth, type BetterAuthHandle } from "./better-auth";
 import { findInstanceMembership, type InstanceOrgRole } from "./membership";
@@ -34,14 +39,15 @@ const bearerToken = (headers: Headers): string | undefined => {
  * API/MCP requests and the browser-decision adapter use this exact lookup, so
  * removing a member denies their next request and a role change takes effect
  * at the next mutation decision, without trusting the global Better Auth user
- * role. A missing row — and a lookup failure — fails `NoOrganization` (403).
+ * role. A missing row fails NoOrganization. A failed read is unavailable.
  */
 export const requireInstanceMembership = (
   betterAuth: BetterAuthHandle,
   userId: string,
   organizationId: string,
-): Effect.Effect<InstanceOrgRole, NoOrganization> =>
+): Effect.Effect<InstanceOrgRole, NoOrganization | Unavailable> =>
   findInstanceMembership(betterAuth, userId, organizationId).pipe(
+    Effect.mapError(() => new Unavailable({ message: "Membership lookup unavailable" })),
     Effect.flatMap((membership) =>
       membership ? Effect.succeed(membership.role) : Effect.fail(new NoOrganization()),
     ),

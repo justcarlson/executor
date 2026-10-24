@@ -10,7 +10,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { afterAll, expect, test } from "@effect/vitest";
+import { afterAll, afterEach, beforeAll, expect, test, vi } from "@effect/vitest";
+import { Effect } from "effect";
 
 import { mintInviteCode } from "../testing/mint-invite";
 
@@ -29,6 +30,8 @@ afterAll(async () => {
   await web.dispose();
   await app.closeDb();
 });
+
+afterEach(() => vi.restoreAllMocks());
 
 const BASE = "http://localhost:4788";
 const DENIED = [401, 403];
@@ -387,3 +390,76 @@ test("role change admin -> member takes effect on the next request for every cre
   expect(await apiProbe(member.token)).toBe(200);
   expect(await apiProbe(key.value)).toBe(200);
 });
+
+let lookupMember: Identity;
+let lookupOAuth: string;
+let lookupKey: string;
+beforeAll(async () => {
+  lookupMember = await signUp("lookup-failure@revocation.test");
+  lookupOAuth = await oauthToken(lookupMember.cookie);
+  lookupKey = (await createKey(lookupMember.token, "lookup failure")).value;
+});
+
+const lookupPaths = [
+  {
+    name: "API session",
+    request: () => withAuth(lookupMember.token, "/api/policies"),
+    denied: 403,
+  },
+  { name: "API key", request: () => withAuth(lookupKey, "/api/policies"), denied: 403 },
+  {
+    name: "account profile",
+    request: () => withCookie(lookupMember.cookie, "/api/account/me"),
+    denied: 401,
+  },
+  {
+    name: "account keys",
+    request: () => withCookie(lookupMember.cookie, "/api/account/api-keys"),
+    denied: 403,
+  },
+  {
+    name: "approval",
+    request: () => withCookie(lookupMember.cookie, "/api/mcp-sessions/none/paused"),
+    denied: 403,
+  },
+  { name: "MCP OAuth", request: () => mcp(bearer(lookupOAuth), initBody), denied: 401 },
+  { name: "MCP session", request: () => mcp(bearer(lookupMember.token), initBody), denied: 401 },
+  { name: "MCP key", request: () => mcp(bearer(lookupKey), initBody), denied: 401 },
+  {
+    name: "MCP cookie",
+    request: () => mcp({ cookie: lookupMember.cookie }, initBody),
+    denied: 401,
+  },
+];
+
+test.each(lookupPaths)(
+  "$name returns 503 without a challenge when membership lookup fails",
+  async ({ request }) => {
+    const { adapter } = await app.betterAuth.auth.$context;
+    const original = adapter.findOne.bind(adapter);
+    vi.spyOn(adapter, "findOne").mockImplementation((options) =>
+      options.model === "member"
+        ? Effect.runPromise(Effect.fail("membership storage unavailable"))
+        : original(options),
+    );
+    const response = await request();
+    expect.soft(response.status).toBe(503);
+    expect.soft(response.headers.get("www-authenticate")).toBeNull();
+    expect.soft(response.headers.get("content-type")).toContain("application/json");
+    expect.soft(await response.text()).toContain("unavailable");
+  },
+);
+
+test.each(lookupPaths)(
+  "$name keeps its denial when membership is absent",
+  async ({ request, denied }) => {
+    const { adapter } = await app.betterAuth.auth.$context;
+    const original = adapter.findOne.bind(adapter);
+    vi.spyOn(adapter, "findOne").mockImplementation((options) =>
+      options.model === "member" ? Promise.resolve(null) : original(options),
+    );
+    const response = await request();
+    expect(response.status).toBe(denied);
+    await response.text();
+  },
+);
