@@ -1,9 +1,15 @@
 import { Effect, Layer } from "effect";
 
 import { AccountProvider, type AccountHeaders } from "@executor-js/api/server";
-import { AccountError, AccountUnauthorized } from "@executor-js/api";
+import {
+  AccountError,
+  AccountNoOrganization,
+  AccountUnauthorized,
+  AccountUnavailable,
+} from "@executor-js/api";
 
 import { BetterAuth } from "../auth/better-auth";
+import { findInstanceMembership } from "../auth/membership";
 
 // ---------------------------------------------------------------------------
 // Self-host AccountProvider — implements the provider-neutral account surface
@@ -37,13 +43,34 @@ const orgRole = (slug: string | undefined): "owner" | "admin" | "member" =>
 export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, BetterAuth> =
   Layer.effect(AccountProvider)(
     Effect.gen(function* () {
-      const { auth, organizationId, organizationName, organizationSlug } = yield* BetterAuth;
+      const betterAuth = yield* BetterAuth;
+      const { auth, organizationId, organizationName, organizationSlug } = betterAuth;
 
       const getSession = (headers: AccountHeaders) =>
         Effect.tryPromise({
           try: () => auth.api.getSession({ headers: toHeaders(headers) }),
           catch: () => new AccountError({ message: "Failed to resolve session" }),
         }).pipe(Effect.orElseSucceed(() => null));
+
+      // Native Better Auth routes can mint credentials without a membership
+      // check. Every use of a credential is checked for current membership.
+      // These account routes also check membership before managing API keys.
+      const requireMember = (headers: AccountHeaders) =>
+        Effect.gen(function* () {
+          const resolved = yield* getSession(headers);
+          if (!resolved) return yield* new AccountUnauthorized();
+          const membership = yield* findInstanceMembership(
+            betterAuth,
+            resolved.user.id,
+            resolved.session.activeOrganizationId ?? organizationId,
+          ).pipe(
+            Effect.mapError(
+              () => new AccountUnavailable({ message: "Membership lookup unavailable" }),
+            ),
+          );
+          if (!membership) return yield* new AccountNoOrganization();
+          return resolved;
+        });
 
       // Run a Better Auth api call, mapping any rejection to a neutral
       // AccountError with a stable, user-facing message.
@@ -53,8 +80,13 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
       return AccountProvider.of({
         me: (headers) =>
           Effect.gen(function* () {
-            const resolved = yield* getSession(headers);
-            if (!resolved) return yield* new AccountUnauthorized();
+            // `me` declares no NoOrganization in its contract: a removed
+            // member is simply no longer signed in to this instance (401).
+            const resolved = yield* requireMember(headers).pipe(
+              Effect.catchTag("AccountNoOrganization", () =>
+                Effect.fail(new AccountUnauthorized()),
+              ),
+            );
             return {
               user: {
                 id: resolved.user.id,
@@ -71,9 +103,12 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           }),
 
         listApiKeys: (headers) =>
-          call("Failed to list API keys", () =>
-            auth.api.listApiKeys({ headers: toHeaders(headers) }),
-          ).pipe(
+          requireMember(headers).pipe(
+            Effect.andThen(
+              call("Failed to list API keys", () =>
+                auth.api.listApiKeys({ headers: toHeaders(headers) }),
+              ),
+            ),
             Effect.map((result) => ({
               apiKeys: result.apiKeys.map((key) => ({
                 id: key.id,
@@ -87,9 +122,12 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           ),
 
         createApiKey: (headers, name) =>
-          call("Failed to create API key", () =>
-            auth.api.createApiKey({ body: { name }, headers: toHeaders(headers) }),
-          ).pipe(
+          requireMember(headers).pipe(
+            Effect.andThen(
+              call("Failed to create API key", () =>
+                auth.api.createApiKey({ body: { name }, headers: toHeaders(headers) }),
+              ),
+            ),
             Effect.map((key) => ({
               id: key.id,
               name: key.name ?? name,
@@ -102,9 +140,14 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           ),
 
         revokeApiKey: (headers, apiKeyId) =>
-          call("Failed to revoke API key", () =>
-            auth.api.deleteApiKey({ body: { keyId: apiKeyId }, headers: toHeaders(headers) }),
-          ).pipe(Effect.as({ success: true })),
+          requireMember(headers).pipe(
+            Effect.andThen(
+              call("Failed to revoke API key", () =>
+                auth.api.deleteApiKey({ body: { keyId: apiKeyId }, headers: toHeaders(headers) }),
+              ),
+            ),
+            Effect.as({ success: true }),
+          ),
 
         // Better Auth has no organization-OWNED key concept: every key it
         // issues belongs to the user who created it. Rather than inventing one

@@ -29,7 +29,7 @@ import {
 } from "@executor-js/sdk/testing";
 import { makeQuickJsExecutor } from "@executor-js/runtime-quickjs";
 import type { CodeExecutor, ExecuteResult } from "@executor-js/codemode-core";
-import { createExecutionEngine } from "./engine";
+import { createExecutionEngine, formatExecuteResult } from "./engine";
 import { ExecutionToolError } from "./errors";
 import {
   describeTool,
@@ -171,6 +171,8 @@ const withPrivateAnnotations = (annotations: ToolAnnotations) => ({
 const makeTestPlugin = (config: {
   readonly pluginId: string;
   readonly integration: string;
+  /** Catalog display name; omitted, the name falls back to the slug. */
+  readonly displayName?: string;
   readonly tools: readonly TestToolSpec[];
 }) => {
   const slug = IntegrationSlug.make(config.integration);
@@ -206,6 +208,7 @@ const makeTestPlugin = (config: {
       seed: () =>
         ctx.core.integrations.register({
           slug,
+          ...(config.displayName === undefined ? {} : { name: config.displayName }),
           description: config.integration,
           config: {},
         }),
@@ -508,6 +511,110 @@ describe("tool discovery", () => {
       const crmMatches = yield* searchTools(executor, "crm create contact", 5);
       expect(crmMatches.items[0]?.path).toBe("crm.org.main.createContact");
       expect(crmMatches.items[0]?.score ?? 0).toBeGreaterThan(crmMatches.items[1]?.score ?? 0);
+    }),
+  );
+
+  it.effect("ranks an integration's tools when the query names it by display name", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeSearchExecutor();
+
+      // "People" is nowhere in the crm slug, names, or descriptions.
+      const without = yield* searchTools(executor, "people contact", 5);
+      expect(without.items.map((match) => match.path)).toEqual([]);
+
+      const aliases = new Map([["crm", "People Desk"]]);
+      const withAlias = yield* searchTools(executor, "people contact", 5, {
+        integrationAliases: aliases,
+      });
+      expect(withAlias.items.map((match) => match.integration)).toEqual(["crm", "crm"]);
+      expect(withAlias.items.map((match) => match.path)).toEqual([
+        "crm.org.main.createContact",
+        "crm.org.main.listContacts",
+      ]);
+
+      // Alias text only ever adds signal; a query that already matched keeps its order.
+      const before = yield* searchTools(executor, "github issues", 5);
+      const after = yield* searchTools(executor, "github issues", 5, {
+        integrationAliases: new Map([["github", "GitHub"]]),
+      });
+      expect(after.items.map((match) => match.path)).toEqual(
+        before.items.map((match) => match.path),
+      );
+    }),
+  );
+
+  it.effect("resolves a namespace alias through the integration catalog", () =>
+    Effect.gen(function* () {
+      const gmail = makeTestPlugin({
+        pluginId: "gmail-alias-test",
+        integration: "google_gmail",
+        displayName: "Gmail",
+        tools: [
+          {
+            name: "listMessages",
+            description: "List messages",
+            inputJsonSchema: EmptyInputJson,
+            validator: EmptyValidator,
+            handler: () => Effect.succeed([]),
+          },
+          {
+            name: "sendMessage",
+            description: "Send a message",
+            inputJsonSchema: EmptyInputJson,
+            validator: EmptyValidator,
+            handler: () => Effect.succeed([]),
+          },
+        ],
+      });
+      const calendar = makeTestPlugin({
+        pluginId: "calendar-alias-test",
+        integration: "google_calendar",
+        displayName: "Google Calendar",
+        tools: [
+          {
+            name: "insertEvent",
+            description: "Create an event",
+            inputJsonSchema: EmptyInputJson,
+            validator: EmptyValidator,
+            handler: () => Effect.succeed({}),
+          },
+        ],
+      });
+      const executor = yield* makeExecutorWith([gmail, calendar] as const);
+      yield* provision(executor as never, [
+        { pluginId: "gmail-alias-test", integration: "google_gmail" },
+        { pluginId: "calendar-alias-test", integration: "google_calendar" },
+      ]);
+
+      // The alias mismatch: "gmail" is not a token prefix of
+      // "google_gmail", so the namespace used to match nothing.
+      const ranked = yield* searchTools(executor, "list messages", 5, { namespace: "gmail" });
+      expect(ranked.items.map((item) => item.path)).toEqual(["google_gmail.org.main.listMessages"]);
+
+      // A display name resolves too, and enumeration scopes by the resolved slug.
+      const enumerated = yield* searchTools(executor, "", 10, { namespace: "Google Calendar" });
+      expect(enumerated.items.map((item) => item.path)).toEqual([
+        "google_calendar.org.main.insertEvent",
+      ]);
+      expect(enumerated.total).toBe(1);
+
+      // An ambiguous alias keeps today's semantics: exact-slug enumeration
+      // finds no integration named "google"; ranked search still prefix-matches.
+      const ambiguous = yield* searchTools(executor, "", 10, { namespace: "google" });
+      expect(ambiguous.total).toBe(0);
+      const prefix = yield* searchTools(executor, "event", 10, { namespace: "google" });
+      expect(prefix.items.map((item) => item.integration)).toEqual(["google_calendar"]);
+
+      // Display-name words rank an integration's tools without a namespace.
+      const byName = yield* searchTools(executor, "gmail send", 5);
+      expect(byName.items[0]?.path).toBe("google_gmail.org.main.sendMessage");
+
+      // A discovery object without the catalog (the passthrough path, which
+      // resolves aliases itself) is unchanged: nothing resolves.
+      const bare = yield* searchTools({ tools: executor.tools }, "list messages", 5, {
+        namespace: "gmail",
+      });
+      expect(bare.items).toEqual([]);
     }),
   );
 
@@ -2029,4 +2136,148 @@ describe("pause/resume with multiple elicitations", () => {
       expect(yield* engine.pausedExecutionCount()).toBe(0);
     }),
   );
+});
+
+describe("connected tool outcome metadata", () => {
+  it.effect(
+    "reports real successes, tool failures and policy denials separately from successful paths",
+    () =>
+      Effect.gen(function* () {
+        const executor = yield* makeExecutorWith([crmPlugin, errorPlugin] as const);
+        yield* provision(executor as never, [
+          { pluginId: "crm-test", integration: "crm" },
+          { pluginId: "error-test", integration: "records" },
+        ]);
+        yield* Effect.addFinalizer(() => executor.close().pipe(Effect.ignore));
+        const paths: string[] = [];
+        const calls: { path: string; status: string }[] = [];
+        const invoker = makeExecutorToolInvoker(executor, {
+          invokeOptions: { onElicitation: acceptAll },
+          onConnectedToolCall: (path) => paths.push(path),
+          onConnectedToolOutcome: (path, status) => calls.push({ path, status }),
+        });
+        yield* invoker.invoke({
+          path: "crm.org.main.listContacts",
+          args: { secret: "argument-secret" },
+        });
+        yield* invoker.invoke({ path: "records.org.main.queryRows", args: {} });
+        yield* executor.policies.create({
+          owner: "org",
+          pattern: "crm.org.main.listContacts",
+          action: "block",
+        });
+        const blocked = yield* invoker.invoke({ path: "crm.org.main.listContacts", args: {} });
+        expect(blocked).toMatchObject({ ok: false, error: { code: "tool_blocked" } });
+        expect(paths).toEqual(["crm.org.main.listContacts"]);
+        expect(calls).toEqual([
+          { path: "crm.org.main.listContacts", status: "ok" },
+          { path: "records.org.main.queryRows", status: "error" },
+          { path: "crm.org.main.listContacts", status: "blocked" },
+        ]);
+        yield* invoker.invoke({ path: "bad.org.main.secret@example.test", args: {} });
+        expect(calls).toHaveLength(3);
+        expect(JSON.stringify(calls)).not.toMatch(/secret|DisplayName|args/);
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("reports a real approval decline as blocked even when invocation fails", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeExecutorWith([crmPlugin] as const);
+      yield* provision(executor as never, [{ pluginId: "crm-test", integration: "crm" }]);
+      yield* Effect.addFinalizer(() => executor.close().pipe(Effect.ignore));
+      const calls: { path: string; status: string }[] = [];
+      const invoker = makeExecutorToolInvoker(executor, {
+        invokeOptions: {
+          onElicitation: () => Effect.succeed(ElicitationResponse.make({ action: "decline" })),
+        },
+        onConnectedToolOutcome: (path, status) => calls.push({ path, status }),
+      });
+      yield* Effect.exit(
+        invoker.invoke({
+          path: "crm.org.main.createContact",
+          args: { email: "argument-secret@example.test" },
+        }),
+      );
+      expect(calls).toEqual([{ path: "crm.org.main.createContact", status: "blocked" }]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("reports an invocation defect as an error without passing the cause to telemetry", () =>
+    Effect.gen(function* () {
+      const executor = yield* makeExecutorWith([unmarkedErrorPlugin] as const);
+      yield* provision(executor as never, [
+        { pluginId: "unmarked-error-test", integration: "unmarked" },
+      ]);
+      yield* Effect.addFinalizer(() => executor.close().pipe(Effect.ignore));
+      const calls: { path: string; status: string }[] = [];
+      const invoker = makeExecutorToolInvoker(executor, {
+        invokeOptions: { onElicitation: acceptAll },
+        onConnectedToolOutcome: (path, status) => calls.push({ path, status }),
+      });
+      yield* Effect.exit(invoker.invoke({ path: "unmarked.org.main.explode", args: {} }));
+      expect(calls).toEqual([{ path: "unmarked.org.main.explode", status: "error" }]);
+    }).pipe(Effect.scoped),
+  );
+
+  for (const mode of ["inline", "pausable", "operator"] as const) {
+    it.effect(
+      `retains real tool outcomes on completed and script-error responses in ${mode} mode`,
+      () =>
+        Effect.gen(function* () {
+          const executor = yield* makeExecutorWith([crmPlugin, errorPlugin] as const);
+          yield* provision(executor as never, [
+            { pluginId: "crm-test", integration: "crm" },
+            { pluginId: "error-test", integration: "records" },
+          ]);
+          yield* executor.policies.create({
+            owner: "org",
+            pattern: "crm.org.main.createContact",
+            action: "block",
+          });
+          const engine = createExecutionEngine({ executor, codeExecutor });
+          yield* Effect.addFinalizer(() =>
+            engine.shutdown.pipe(Effect.andThen(executor.close()), Effect.ignore),
+          );
+          const run = (code: string) =>
+            mode === "inline"
+              ? engine.execute(code, { onElicitation: acceptAll })
+              : engine.executeWithPause(code, { autoApprove: mode === "operator" }).pipe(
+                  Effect.map((outcome) => {
+                    return outcome.status === "completed"
+                      ? outcome.result
+                      : { result: null, error: "Unexpected pause" };
+                  }),
+                );
+          const completed = yield* run(
+            [
+              "await tools.crm.org.main.listContacts({});",
+              "await tools.records.org.main.queryRows({});",
+              "await tools.crm.org.main.createContact({ email: 'argument-secret@example.test' });",
+              "await tools.records.org.main.queryRows({});",
+              "return 42;",
+            ].join("\n"),
+          );
+          expect(completed.error).toBeUndefined();
+          expect(completed.toolPaths).toEqual(["crm.org.main.listContacts"]);
+          expect(formatExecuteResult(completed).structured).toMatchObject({
+            status: "completed",
+            toolName: "crm.org.main.listContacts",
+            toolCalls: [
+              { path: "crm.org.main.listContacts", status: "ok" },
+              { path: "records.org.main.queryRows", status: "error" },
+              { path: "crm.org.main.createContact", status: "blocked" },
+            ],
+          });
+          const failed = yield* run(
+            "await tools.crm.org.main.listContacts({}); throw new Error('script-secret');",
+          );
+          expect(failed.error).toContain("script-secret");
+          expect(formatExecuteResult(failed).structured).toMatchObject({
+            status: "error",
+            toolPaths: ["crm.org.main.listContacts"],
+            toolCalls: [{ path: "crm.org.main.listContacts", status: "ok" }],
+          });
+        }).pipe(Effect.scoped),
+    );
+  }
 });

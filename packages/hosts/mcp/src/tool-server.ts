@@ -87,10 +87,16 @@ import {
 } from "./artifact-bindings";
 import { MCP_ORG_WRITE_ACCESS_HEADER } from "./seams";
 import {
+  compactArguments,
+  compactDescription,
+  integrationAliasText,
+  type IntegrationResolution,
   passthroughCallCode,
   passthroughInstructions,
+  resolveIntegrationAlias,
   SEARCH_INVOKE_SKILL,
 } from "./passthrough-tools";
+import { codemodeInstructions } from "./codemode-instructions";
 import type { McpToolMode } from "./browser-approval";
 
 // ---------------------------------------------------------------------------
@@ -1267,6 +1273,32 @@ const passthroughInputSchema = (view: ToolSchemaView): unknown =>
     new Map(Object.entries(view.schemaDefinitions ?? {})),
   );
 
+/**
+ * The slugs an `integration` argument selects, and the envelope fields that
+ * tell the model how the alias resolved. An exact slug adds nothing; an alias
+ * reports the slug it became; an ambiguous alias reports every candidate and
+ * selects all of them; an unknown value stays an exact filter and adds a hint.
+ */
+const selectedIntegrations = (
+  resolution: IntegrationResolution | undefined,
+  input: string | undefined,
+): { readonly slugs: ReadonlySet<string> | null; readonly envelope: Record<string, unknown> } => {
+  if (resolution === undefined || input === undefined) return { slugs: null, envelope: {} };
+  if (resolution.kind === "exact") return { slugs: new Set([resolution.slug]), envelope: {} };
+  if (resolution.kind === "alias")
+    return { slugs: new Set([resolution.slug]), envelope: { integration: resolution.slug } };
+  if (resolution.kind === "ambiguous")
+    return { slugs: new Set(resolution.slugs), envelope: { integrations: resolution.slugs } };
+  // Keep the value as an exact filter (it may be a slug the metadata catalog
+  // does not list), and say what to do if it was a typo.
+  return {
+    slugs: new Set([input]),
+    envelope: {
+      hint: `No integration matches "${input}". Call integrations to list the connected slugs.`,
+    },
+  };
+};
+
 /** Register discovery over the existing APIs, with no catalog work at connection time. */
 const registerPassthroughTools = <E extends Cause.YieldableError>(
   server: McpServer,
@@ -1300,9 +1332,14 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
         "integrations",
         {
           description:
-            "List connected integrations and accounts visible to you. Returns integration descriptions, account labels, exact search filters, and last recorded health (null means unchecked). One item per account; use nextOffset for more. Does not load tool schemas or check credentials.",
+            "List connected integrations and accounts: slug, name, owner, connection, last health. Call once to learn the exact slug for search; skip it when you already know the slug.",
           inputSchema: {
-            integration: z.string().trim().min(1).optional().describe("Exact integration slug."),
+            integration: z
+              .string()
+              .trim()
+              .min(1)
+              .optional()
+              .describe("Slug or alias (gmail resolves to google_gmail)."),
             owner: z.enum(["org", "user"]).optional(),
             limit: z.number().int().min(1).max(50).default(20),
             offset: z.number().int().min(0).default(0),
@@ -1317,12 +1354,25 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                 integrations.list(),
               ]);
               const metadata = new Map(catalog.map((item) => [String(item.slug), item]));
+              const selected = selectedIntegrations(
+                integration === undefined
+                  ? undefined
+                  : resolveIntegrationAlias(
+                      integration,
+                      catalog.map((item) => ({
+                        slug: String(item.slug),
+                        name: item.name,
+                        description: item.description,
+                      })),
+                    ),
+                integration,
+              );
               const visible = accounts
                 .flatMap((account) => {
                   const item = metadata.get(account.integration);
                   if (
                     !item ||
-                    (integration !== undefined && account.integration !== integration) ||
+                    (selected.slugs !== null && !selected.slugs.has(account.integration)) ||
                     (owner !== undefined && account.owner !== owner)
                   )
                     return [];
@@ -1358,6 +1408,7 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                 total: visible.length,
                 hasMore,
                 nextOffset: hasMore ? offset + items.length : null,
+                ...selected.envelope,
               };
               return {
                 content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -1371,55 +1422,90 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
         "search",
         {
           description:
-            "Search connected integration tools by action, integration, or account. Returns matching tool IDs, account details, and full JSON input schemas. Pass the returned ID and arguments to invoke. Use integrations to discover accounts, then pass exact integration, owner, and connection filters. Use nextOffset to page through matches.",
+            "Find tools by action words. Fastest: pass integration (slug or alias) and limit 3. Each hit has id, one-line description, and arguments (name (type, required)); pass id and arguments to invoke. detail: full adds the complete inputSchema (large) when the summary is not enough. Page with offset: nextOffset.",
           inputSchema: {
             query: z
               .string()
               .trim()
               .min(1)
               .max(500)
-              .describe("Keywords describing the tool or task, such as github create issue."),
+              .describe("Action words, such as create issue or list dns records."),
             integration: z
               .string()
               .trim()
               .min(1)
               .optional()
-              .describe("Exact integration slug from integrations."),
+              .describe(
+                "Slug or alias (gmail resolves to google_gmail); the result reports the slug.",
+              ),
             owner: z.enum(["org", "user"]).optional(),
             connection: z
               .string()
               .trim()
               .min(1)
               .optional()
-              .describe(
-                "Exact account name from integrations; pair with integration and owner to select one account.",
-              ),
+              .describe("Account name from integrations; pair with integration and owner."),
             limit: z.number().int().min(1).max(20).default(10),
             offset: z.number().int().min(0).default(0),
+            detail: z
+              .enum(["compact", "full"])
+              .default("compact")
+              .describe("full adds the complete inputSchema per hit; use with limit 1-3."),
           },
           annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
         },
-        ({ query, integration, owner, connection, limit, offset }, extra) =>
+        ({ query, integration, owner, connection, limit, offset, detail }, extra) =>
           boundary(
             Effect.gen(function* () {
+              // Catalog metadata is cheap and lets `integration` accept the
+              // name a person would use ("gmail" → google_gmail) and lets
+              // query words that name an integration rank its tools.
+              const catalog = (yield* integrations.list()).map((item) => ({
+                slug: String(item.slug),
+                name: item.name,
+                description: item.description,
+              }));
+              const selected = selectedIntegrations(
+                integration === undefined
+                  ? undefined
+                  : resolveIntegrationAlias(integration, catalog),
+                integration,
+              );
+              // One slug narrows the list read itself (the fast path); several
+              // candidates read the whole visible catalog once and keep theirs.
+              const exactSlug =
+                selected.slugs !== null && selected.slugs.size === 1
+                  ? [...selected.slugs][0]
+                  : undefined;
               const discovery = {
                 tools: {
                   list: (filter?: Parameters<McpToolsPort["list"]>[0]) =>
                     tools
                       .list({
                         ...filter,
-                        ...(integration === undefined
+                        ...(exactSlug === undefined
                           ? {}
-                          : { integration: IntegrationSlug.make(integration) }),
+                          : { integration: IntegrationSlug.make(exactSlug) }),
                         ...(owner === undefined ? {} : { owner }),
                         ...(connection === undefined
                           ? {}
                           : { connection: ConnectionName.make(connection) }),
                       })
-                      .pipe(Effect.map((items) => items.filter((tool) => tool.static !== true))),
+                      .pipe(
+                        Effect.map((items) =>
+                          items.filter(
+                            (tool) =>
+                              tool.static !== true &&
+                              (selected.slugs === null || selected.slugs.has(tool.integration)),
+                          ),
+                        ),
+                      ),
                 },
               };
-              const page = yield* searchTools(discovery, query, limit, { offset });
+              const page = yield* searchTools(discovery, query, limit, {
+                offset,
+                integrationAliases: integrationAliasText(catalog),
+              });
               const candidates = yield* Effect.forEach(
                 page.items,
                 (match) =>
@@ -1427,23 +1513,45 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                     const address = ToolAddress.make(`tools.${match.path}`);
                     const identity = parseToolAddress(String(address));
                     if (!identity) return null;
-                    const schema = yield* tools.schema(address);
+                    // Search returns JSON Schema only; skip the TypeScript preview.
+                    const schema = yield* tools.schema(address, { typeScript: false });
                     // Visibility can change between listing and schema lookup.
                     if (!schema) return null;
-                    return {
+                    const identityFields = {
                       id: String(address),
                       name: match.name,
                       integration: identity.integration,
                       owner: identity.owner,
                       connection: identity.connection,
-                      description: match.description,
-                      inputSchema: passthroughInputSchema(schema),
-                      ...(schema.annotations ? { annotations: schema.annotations } : {}),
                     };
+                    const annotations = schema.annotations
+                      ? { annotations: schema.annotations }
+                      : {};
+                    // Compact hits carry what a model needs to choose a tool
+                    // and usually to call it; the full schema is one more
+                    // search away (`detail: "full"`) or comes back with an
+                    // invoke validation error.
+                    return detail === "full"
+                      ? {
+                          ...identityFields,
+                          description: match.description,
+                          inputSchema: passthroughInputSchema(schema),
+                          ...annotations,
+                        }
+                      : {
+                          ...identityFields,
+                          description: compactDescription(match.description),
+                          arguments: compactArguments(schema.inputSchema, schema.schemaDefinitions),
+                          ...annotations,
+                        };
                   }),
                 { concurrency: 4 },
               );
-              const result = { ...page, items: candidates.filter(Predicate.isNotNull) };
+              const result = {
+                ...page,
+                items: candidates.filter(Predicate.isNotNull),
+                ...selected.envelope,
+              };
               return {
                 content: [{ type: "text" as const, text: JSON.stringify(result) }],
                 structuredContent: result,
@@ -1456,12 +1564,12 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
         "invoke",
         {
           description:
-            "Call one connected integration tool using the exact ID and JSON input schema returned by search. May read or change external state. Your client handles approval for this call; workspace blocks remain enforced.",
+            "Call one tool by the exact id from search with a JSON arguments object. Returns the tool's result; an invalid-arguments error includes the expected inputSchema, so correct and retry. May change external state; your client handles approval and workspace blocks stay enforced.",
           inputSchema: {
-            tool: z.string().min(1).describe("Exact tool ID returned by search."),
+            tool: z.string().min(1).describe("Exact id from a search hit."),
             arguments: z
               .record(z.string(), z.unknown())
-              .describe("Tool arguments matching the inputSchema returned by search."),
+              .describe("JSON object matching the hit's arguments summary or inputSchema."),
           },
           annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
         },
@@ -1490,7 +1598,7 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
               });
               if (!visible.some((tool) => tool.static !== true && tool.address === address))
                 return unavailable;
-              const schema = yield* tools.schema(address);
+              const schema = yield* tools.schema(address, { typeScript: false });
               if (!schema) return unavailable;
               // The SDK validator checks this dynamic JSON schema at the MCP boundary.
               const validate = validator.getValidator<unknown>(
@@ -1503,7 +1611,9 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                   content: [
                     {
                       type: "text" as const,
-                      text: `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}`,
+                      // The schema rides along so the model can correct the
+                      // call without another search.
+                      text: `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}. Expected inputSchema: ${JSON.stringify(passthroughInputSchema(schema))}`,
                     },
                   ],
                 };
@@ -1524,12 +1634,17 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
 ): Effect.Effect<McpServer, McpPassthroughUnavailableError> =>
   Effect.gen(function* () {
     const engine = "engine" in config ? config.engine : createExecutionEngine(config);
-    const description =
-      config.description ??
-      (yield* engine.getDescription.pipe(Effect.withSpan("mcp.host.get_description")));
-    // The same live integration inventory the description carries, re-used by
-    // the `skills` tool so the `execute` guide lists what is connected too.
-    const executeInventory = extractInventory(description);
+    // The `execute` description reads the live connection and integration
+    // inventory, two catalog reads per session. Codemode needs it at
+    // construction: it is the `execute` tool's description and the source of
+    // the per-integration search tools. Passthrough registers neither, so it
+    // reads the description only on demand (the `execute` guide from `skills`),
+    // once per session — a session that never asks never pays for it.
+    const loadDescription = yield* Effect.cached(
+      config.description !== undefined
+        ? Effect.succeed(config.description)
+        : engine.getDescription.pipe(Effect.withSpan("mcp.host.get_description")),
+    );
     // Artifacts are on unless this connection opted out (`?artifacts=false`).
     // One flag decides the whole surface: the tools, the shell resource, and
     // the skills catalog below.
@@ -1559,6 +1674,10 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           "passthrough mode requires tool list/schema, connection list, and integration list APIs",
       });
     }
+    const description = passthrough ? "" : yield* loadDescription;
+    // The same live integration inventory the description carries, re-used by
+    // the `skills` tool so the `execute` guide lists what is connected too.
+    const executeInventory = loadDescription.pipe(Effect.map(extractInventory));
 
     // Captured at construction time. SDK callbacks fire later (often
     // deferred past the outer Effect's await), so we use the runtime to
@@ -1659,11 +1778,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             // per host.
             capabilities: { resources: {}, tools: {} },
             jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
-            ...(passthrough
-              ? {
-                  instructions: passthroughInstructions(),
-                }
-              : {}),
+            instructions: passthrough ? passthroughInstructions() : codemodeInstructions(),
           },
         ),
     ).pipe(Effect.withSpan("mcp.host.create_server"));
@@ -2074,7 +2189,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         {
           annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
           description: passthrough
-            ? 'Documentation for this server only, not harness or project skills. Call with no name to list guides, or skills({ name: "search-invoke" }) for account discovery, tool search, invocation, and pagination.'
+            ? 'Guides for this server only, not harness or project skills. skills({ name: "search-invoke" }) explains discovery, aliases, pagination, and approval; no name lists the guides.'
             : [
                 "Documentation for THIS server's own tools. Not a general skill reader: it serves a short, fixed set of how-to docs about using `execute` and artifacts here, and it cannot reach your harness's skills, a SKILL.md on disk, or any user- or project-authored skill. The argument is a name from its own catalog, never a path or an outside skill's id.",
                 "These docs hold the long-form guidance that would otherwise bloat another tool's always-loaded description.",
@@ -2086,12 +2201,19 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               .string()
               .optional()
               .describe(
-                `A doc from this server's own catalog, e.g. "${passthrough ? "search-invoke" : "execute"}". Omit to list the catalog.`,
+                passthrough
+                  ? 'Guide name, e.g. "search-invoke". Omit to list guides.'
+                  : `A doc from this server's own catalog, e.g. "execute". Omit to list the catalog.`,
               ),
           },
         },
         ({ name }, extra) =>
-          runToolEffect(Effect.succeed(skillsResult(name, executeInventory, skillCatalog)), extra),
+          runToolEffect(
+            executeInventory.pipe(
+              Effect.map((inventory) => skillsResult(name, inventory, skillCatalog)),
+            ),
+            extra,
+          ),
       ),
     ).pipe(
       Effect.withSpan("mcp.host.register_tool", {
