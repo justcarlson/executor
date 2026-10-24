@@ -72,7 +72,13 @@ const makeFixture = (
       waitUntil: (promise) => completions.push(promise),
     });
     yield* executor["refresh-fixture"].seed();
-    const drain = Effect.promise(() => Promise.all(completions));
+    const drain = Effect.gen(function* () {
+      let registered: number;
+      do {
+        registered = completions.length;
+        yield* Effect.promise(() => Promise.all(completions));
+      } while (registered !== completions.length);
+    });
     const expire = Effect.promise(() =>
       config.db.updateMany("connection", { set: { tools_synced_at: 1 } }),
     );
@@ -83,10 +89,50 @@ const makeFixture = (
         template: NO_AUTH_TEMPLATE,
         inputs: {},
       });
-    return { executor, config, drain, expire, create };
+    return { executor, config, drain, expire, create, completions };
   });
 
 describe("file-backed catalog refresh", () => {
+  it.live("settles every queued batch when a shared discovery is interrupted", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const interrupted = yield* Deferred.make<void>();
+        let refreshing = false;
+        let first: string | undefined;
+        const discoveries: string[] = [];
+        const fixture = yield* makeFixture((name) =>
+          Effect.gen(function* () {
+            if (!refreshing) return catalog;
+            discoveries.push(name);
+            if (first === undefined) first = name;
+            if (name === first) {
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(release);
+              return catalog;
+            }
+            yield* Deferred.succeed(interrupted, undefined);
+            return yield* Effect.interrupt;
+          }),
+        );
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        yield* fixture.create("a");
+        yield* fixture.create("b");
+        yield* fixture.expire;
+        refreshing = true;
+        yield* fixture.executor.tools.list();
+        yield* Deferred.await(started).pipe(Effect.timeout(2000));
+        yield* fixture.executor.tools.list();
+        expect(fixture.completions).toHaveLength(4);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(interrupted).pipe(Effect.timeout(2000));
+        expect(Option.isSome(yield* fixture.drain.pipe(Effect.timeoutOption(2000)))).toBe(true);
+        expect(discoveries.slice().sort()).toEqual(["a", "b"]);
+      }),
+    ),
+  );
+
   it.live("discovers newly stale connections while an urgent discovery is held", () =>
     Effect.scoped(
       Effect.gen(function* () {

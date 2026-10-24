@@ -5625,8 +5625,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const toolsSyncTtlMs =
       config.toolsSyncTtlMs === undefined ? DEFAULT_TOOLS_SYNC_TTL_MS : config.toolsSyncTtlMs;
 
+    // A wave of remote discoveries can consume CPUs needed by catalog reads.
     const detachedToolSyncLock = Semaphore.makeUnsafe(1);
-    const queuedToolSyncs = new Map<string, Deferred.Deferred<void, StorageFailure>>();
+    const queuedToolSyncs = new Map<string, Deferred.Deferred<void>>();
     const queueDetachedToolSync = (
       connection: ConnectionRow,
       ref: ConnectionRef,
@@ -5637,7 +5638,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const key = `${ref.owner}:${String(ref.integration)}:${String(ref.name)}`;
           const queued = queuedToolSyncs.get(key);
           if (queued) return yield* restore(Deferred.await(queued));
-          const done = Deferred.makeUnsafe<void, StorageFailure>();
+          const done = Deferred.makeUnsafe<void>();
           queuedToolSyncs.set(key, done);
           const run = detachedToolSyncLock.withPermits(1)(
             Effect.gen(function* () {
@@ -5650,9 +5651,18 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           );
           yield* Effect.forkDetach(
             restore(run).pipe(
-              Effect.exit,
-              Effect.flatMap((exit) => Deferred.done(done, exit)),
-              Effect.ensuring(Effect.sync(() => void queuedToolSyncs.delete(key))),
+              Effect.catch((error) =>
+                Effect.logWarning("executor detached tool sync failed", {
+                  integration: connection.integration,
+                  connection: connection.name,
+                  error: describeSyncFailure(error),
+                }),
+              ),
+              Effect.ensuring(
+                Effect.sync(() => void queuedToolSyncs.delete(key)).pipe(
+                  Effect.andThen(Deferred.succeed(done, undefined)),
+                ),
+              ),
             ),
           );
           yield* restore(Deferred.await(done));
@@ -5786,17 +5796,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           if (mode === "converge" || ((staleMarked || configRevised) && toolsSyncGraceMs !== 0)) {
             urgent.push(rebuild);
           } else {
-            deferred.push(
-              queueDetachedToolSync(connection, ref, rebuild).pipe(
-                Effect.catch((error) =>
-                  Effect.logWarning("executor detached tool sync failed", {
-                    integration: connection.integration,
-                    connection: connection.name,
-                    error: describeSyncFailure(error),
-                  }),
-                ),
-              ),
-            );
+            deferred.push(queueDetachedToolSync(connection, ref, rebuild));
           }
         }
         if (deferred.length > 0) {
