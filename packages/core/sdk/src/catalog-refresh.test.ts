@@ -92,7 +92,146 @@ const makeFixture = (
     return { executor, config, drain, expire, create, completions };
   });
 
+const makeHeldReaderFixture = (
+  options: { readonly graceMs?: number; readonly incomplete?: boolean } = {},
+) =>
+  Effect.gen(function* () {
+    const reading = yield* Deferred.make<void>();
+    const secondReading = yield* Deferred.make<void>();
+    const discoveryStarted = yield* Deferred.make<void>();
+    const releaseRead = yield* Deferred.make<void>();
+    let holdRead = false;
+    let readers = 0;
+    let discoveries = 0;
+    let refreshing = false;
+    const fixture = yield* makeFixture(
+      () =>
+        Effect.gen(function* () {
+          if (refreshing) {
+            discoveries += 1;
+            yield* Deferred.succeed(discoveryStarted, undefined);
+          }
+          return refreshing && options.incomplete
+            ? { tools: [], incomplete: true, incompleteReason: "fixture offline" }
+            : catalog;
+        }),
+      {
+        graceMs: options.graceMs,
+        readPolicy: Effect.gen(function* () {
+          if (!holdRead) return;
+          readers += 1;
+          yield* Deferred.succeed(readers === 1 ? reading : secondReading, undefined);
+          yield* Deferred.await(releaseRead);
+        }),
+      },
+    );
+    yield* Effect.addFinalizer(() =>
+      Deferred.succeed(releaseRead, undefined).pipe(Effect.andThen(fixture.drain)),
+    );
+    yield* fixture.create("main");
+    const before = yield* fixture.executor.tools.list();
+    yield* fixture.drain;
+    if (options.graceMs === 0) {
+      yield* Effect.promise(() =>
+        fixture.config.db.updateMany("connection", { set: { tools_synced_at: null } }),
+      );
+    } else {
+      yield* fixture.expire;
+    }
+    holdRead = true;
+    refreshing = true;
+    const reader = yield* Effect.forkChild(fixture.executor.tools.list());
+    yield* Deferred.await(reading);
+    yield* Effect.sleep(20);
+    return {
+      ...fixture,
+      before,
+      reader,
+      secondReading,
+      discoveryStarted,
+      releaseRead,
+      discoveries: () => discoveries,
+      resumeReads: Effect.sync(() => {
+        holdRead = false;
+      }),
+    };
+  });
+
 describe("file-backed catalog refresh", () => {
+  it.live(
+    "prioritizes cached reads and resumes discovery after the last reader is interrupted",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fixture = yield* makeHeldReaderFixture({ graceMs: 0 });
+          expect(fixture.discoveries()).toBe(0);
+          const second = yield* Effect.forkChild(fixture.executor.tools.list());
+          yield* Deferred.await(fixture.secondReading);
+          yield* Fiber.interrupt(fixture.reader);
+          yield* Effect.sleep(20);
+          expect(fixture.discoveries()).toBe(0);
+          yield* Fiber.interrupt(second);
+          yield* fixture.drain.pipe(Effect.timeout(500));
+          expect(fixture.discoveries()).toBe(1);
+          yield* fixture.resumeReads;
+          expect(yield* fixture.executor.tools.list()).toEqual(fixture.before);
+        }),
+      ),
+  );
+
+  it.live("prioritizes cached reads but completes discovery while a reader never stops", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* makeHeldReaderFixture();
+        expect(fixture.discoveries()).toBe(0);
+        yield* Deferred.await(fixture.discoveryStarted).pipe(Effect.timeout(1250));
+        yield* fixture.drain.pipe(Effect.timeout(3000));
+        expect(fixture.discoveries()).toBe(1);
+        yield* Deferred.succeed(fixture.releaseRead, undefined);
+        expect(yield* Fiber.join(fixture.reader)).toEqual(fixture.before);
+        yield* fixture.resumeReads;
+        expect(yield* fixture.executor.tools.list()).toEqual(fixture.before);
+      }),
+    ),
+  );
+
+  it.live("lets an explicit refresh join reader-deferred discovery and retain full schemas", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* makeHeldReaderFixture({ incomplete: true });
+        expect(fixture.discoveries()).toBe(0);
+        const tools = yield* fixture.executor.connections.refresh(ref).pipe(Effect.timeout(500));
+        const retained = tools.find((tool) => String(tool.name) === "list");
+        expect(retained?.inputSchema).toEqual(catalog.tools[0]?.inputSchema);
+        expect(retained?.outputSchema).toEqual(catalog.tools[0]?.outputSchema);
+        yield* fixture.drain;
+        expect(fixture.discoveries()).toBe(1);
+        yield* Deferred.succeed(fixture.releaseRead, undefined);
+        expect(yield* Fiber.join(fixture.reader)).toEqual(fixture.before);
+      }),
+    ),
+  );
+
+  it.live("lets an urgent read promote reader-deferred discovery within its grace wait", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fixture = yield* makeHeldReaderFixture();
+        expect(fixture.discoveries()).toBe(0);
+        yield* fixture.resumeReads;
+        yield* Effect.promise(() =>
+          fixture.config.db.updateMany("connection", { set: { tools_synced_at: null } }),
+        );
+        expect(yield* fixture.executor.tools.list().pipe(Effect.timeout(500))).toEqual(
+          fixture.before,
+        );
+        yield* fixture.drain;
+        expect(fixture.discoveries()).toBe(1);
+        yield* Deferred.succeed(fixture.releaseRead, undefined);
+        expect(yield* Fiber.join(fixture.reader)).toEqual(fixture.before);
+      }),
+    ),
+  );
+
   for (const { column, change, stored } of [
     {
       column: "description",
