@@ -3878,7 +3878,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           else if (requestedMode === "background" && existing.mode === "detached")
             existing.mode = "background";
           return requestedMode === "detached"
-            ? Deferred.await(existing.deferred)
+            ? Effect.succeed([])
             : Deferred.succeed(existing.foreground, undefined).pipe(
                 Effect.andThen(Deferred.await(existing.deferred)),
               );

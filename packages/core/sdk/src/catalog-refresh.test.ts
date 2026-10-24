@@ -303,6 +303,63 @@ describe("file-backed catalog refresh", () => {
     ),
   );
 
+  it.live(
+    "skips an owned production and refreshes later queued connections after interruption",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const started = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const discoveredA = yield* Deferred.make<void>();
+          let refreshing = false;
+          const discoveries: string[] = [];
+          const fixture = yield* makeFixture((name) =>
+            Effect.gen(function* () {
+              if (!refreshing) return catalog;
+              discoveries.push(name);
+              if (name === "b") {
+                yield* Deferred.succeed(started, undefined);
+                yield* Deferred.await(release);
+                return yield* Effect.interrupt;
+              }
+              yield* Deferred.succeed(discoveredA, undefined);
+              return catalog;
+            }),
+          );
+          yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+          yield* fixture.create("a");
+          yield* fixture.create("b");
+          yield* Effect.promise(() =>
+            fixture.config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "b"),
+              set: { tools_synced_at: 1 },
+            }),
+          );
+          refreshing = true;
+          const explicit = yield* Effect.forkChild(
+            fixture.executor.connections.refresh({ ...ref, name: ConnectionName.make("b") }),
+          );
+          yield* Deferred.await(started).pipe(Effect.timeout(10_000));
+          yield* fixture.executor.tools.list();
+          yield* fixture.drain.pipe(Effect.timeout(10_000));
+          expect(discoveries).toEqual(["b"]);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.await(explicit).pipe(Effect.timeout(10_000));
+          yield* Effect.promise(() =>
+            fixture.config.db.updateMany("connection", {
+              set: { tools_synced_at: 1 },
+              where: (b) => b("name", "=", "a"),
+            }),
+          );
+          yield* fixture.executor.tools.list();
+          yield* Deferred.await(discoveredA).pipe(Effect.timeout(10_000));
+          yield* fixture.drain.pipe(Effect.timeout(10_000));
+          expect(discoveries.filter((name) => name === "a")).toHaveLength(1);
+        }),
+      ),
+    { timeout: 30_000 },
+  );
+
   it.live("settles every queued batch when a shared discovery is interrupted", () =>
     Effect.scoped(
       Effect.gen(function* () {
