@@ -4,7 +4,7 @@ import { TestClock } from "effect/testing";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-import { createExecutor } from "./executor";
+import { CATALOG_READER_WAIT_MS, createExecutor } from "./executor";
 import { ConnectionName, IntegrationSlug, NO_AUTH_TEMPLATE, ToolName } from "./ids";
 import { definePlugin, type ResolveToolsResult } from "./plugin";
 import { makeTestConfig, memoryCredentialsPlugin } from "./testing";
@@ -185,8 +185,10 @@ describe("file-backed catalog refresh", () => {
       Effect.gen(function* () {
         const fixture = yield* makeHeldReaderFixture();
         expect(fixture.discoveries()).toBe(0);
-        yield* Deferred.await(fixture.discoveryStarted).pipe(Effect.timeout(1250));
-        yield* fixture.drain.pipe(Effect.timeout(3000));
+        yield* Deferred.await(fixture.discoveryStarted).pipe(
+          Effect.timeout(CATALOG_READER_WAIT_MS + 250),
+        );
+        yield* fixture.drain.pipe(Effect.timeout(CATALOG_READER_WAIT_MS * 3));
         expect(fixture.discoveries()).toBe(1);
         yield* Deferred.succeed(fixture.releaseRead, undefined);
         expect(yield* Fiber.join(fixture.reader)).toEqual(fixture.before);
@@ -413,7 +415,7 @@ describe("file-backed catalog refresh", () => {
             Effect.provideService(Clock.Clock, {
               ...clock,
               sleep: (duration) =>
-                observePark && Duration.toMillis(duration) === 1000
+                observePark && Duration.toMillis(duration) === CATALOG_READER_WAIT_MS
                   ? Deferred.succeed(parked, undefined).pipe(Effect.andThen(clock.sleep(duration)))
                   : clock.sleep(duration),
             }),
