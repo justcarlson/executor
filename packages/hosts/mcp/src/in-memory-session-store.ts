@@ -72,8 +72,8 @@ import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./too
 // answers; a POST carrying just the `notifications/initialized` notification
 // still gets a bare 202, which is exactly the cue the client SDK uses to open
 // the long-lived `GET /mcp` stream. So essentially every session holds an open
-// server-to-client stream for its whole life. That stream is silent by design
-// (it exists for server-initiated messages) and this transport does no max-age
+// server-to-client stream for its whole life. After its opening comment, the
+// stream carries only server-initiated messages. This transport does no max-age
 // rotation, so it produces no recurring request to stamp against — an open
 // stream tells us the socket is up, never that the peer is still working.
 //
@@ -372,6 +372,23 @@ export const makeInMemoryMcpSessionStore = (
             transport.handleRequest(withOrgWriteAccess(request, orgWriteAccess)),
           );
     return handle.pipe(
+      Effect.map((response) =>
+        request.method === "GET" &&
+        response.status === 200 &&
+        response.headers.get("content-type")?.startsWith("text/event-stream") &&
+        response.body
+          ? new Response(
+              response.body.pipeThrough(
+                new TransformStream<Uint8Array, Uint8Array>({
+                  // A first chunk lets HTTP servers flush the SSE headers before any event.
+                  start: (controller) =>
+                    controller.enqueue(new TextEncoder().encode(": connected\n\n")),
+                }),
+              ),
+              response,
+            )
+          : response,
+      ),
       Effect.tap(() => Effect.sync(finish)),
       Effect.catchCause((cause) =>
         Effect.sync(() => {

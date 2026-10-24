@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, type Cause } from "effect";
+import { Effect, Option, type Cause } from "effect";
 
 import type { ExecutionEngine } from "@executor-js/execution";
 import { FormElicitation, ToolAddress, createExecutor } from "@executor-js/sdk";
@@ -598,7 +598,7 @@ const dispatchPost = (
         }),
         principal: TEST_PRINCIPAL,
         resource: defaultMcpResource,
-        sessionId: null,
+        sessionId: headers["mcp-session-id"] ?? null,
         method: "POST",
       })
       .pipe(
@@ -777,3 +777,46 @@ describe("pre-initialize dispatch through the in-memory session store", () => {
     expect(sessions.sessionCount()).toBe(0);
   });
 });
+
+it.live("starts an initialized session GET stream within one second", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { sessions } = yield* Effect.acquireRelease(
+        Effect.sync(makeServingStore),
+        ({ sessions }) => Effect.promise(() => sessions.close()),
+      );
+      const sessionId = yield* Effect.promise(() => openSession(sessions));
+      const notification = yield* Effect.promise(() =>
+        dispatchPost(
+          sessions,
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { ...MCP_POST_HEADERS, "mcp-session-id": sessionId },
+        ),
+      );
+      expect(notification.status).toBe(202);
+      const response = yield* sessions.store.dispatch({
+        request: new Request("https://executor.test/mcp?mode=passthrough", {
+          headers: { accept: "text/event-stream", "mcp-session-id": sessionId },
+        }),
+        principal: TEST_PRINCIPAL,
+        resource: defaultMcpResource,
+        sessionId,
+        method: "GET",
+      });
+      if (!(response instanceof Response)) return yield* Effect.fail("Expected HTTP response");
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      const body = response.body;
+      if (!body) return yield* Effect.fail("Expected SSE body");
+      const reader = yield* Effect.acquireRelease(
+        Effect.sync(() => body.getReader()),
+        (reader) => Effect.promise(() => reader.cancel()),
+      );
+      const first = yield* Effect.promise(() => reader.read()).pipe(Effect.timeoutOption(1_000));
+      expect(Option.isSome(first)).toBe(true);
+      expect(Option.map(first, (chunk) => new TextDecoder().decode(chunk.value))).toEqual(
+        Option.some(": connected\n\n"),
+      );
+    }),
+  ),
+);
