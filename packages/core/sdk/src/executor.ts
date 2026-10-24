@@ -3543,8 +3543,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // failure #1563 fixed for concurrent refreshes of the SAME connection via
     // the single-flight map below. Rebuilding several DIFFERENT connections
     // together (the stale-catalog fan-out) reopens the same hazard from the
-    // other side, so the write phase takes a single permit: the fan-out's
-    // discoveries still run together and their commits form a queue.
+    // other side, so the write phase takes a single permit even when urgent
+    // discoveries overlap or bypass the detached discovery queue.
     //
     // Never take this permit while a transaction is already open on this fiber
     // — every caller of `persistCatalog` must be outside one, as all of the
@@ -5719,12 +5719,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               ? b.isNull("tools_synced_at")
               : b.or(b.isNull("tools_synced_at"), b("tools_synced_at", "<", staleBefore)),
         });
-        // Each rebuild is an independent upstream listing, so they run together
-        // rather than one after another: a host with many stale remote-catalog
-        // connections otherwise pays the sum of every server's latency on the
-        // read that trips the TTL. Only the listings overlap — `persistCatalog`
-        // keeps the catalog writes in a single-file queue, so this fan-out never
-        // opens two transactions on a one-connection database.
+        // Urgent rebuilds can overlap. Detached TTL discoveries use a serial
+        // queue to limit contention with reads. `persistCatalog` serializes
+        // writes from both paths on a one-connection database.
         //
         // Two urgency classes. A stale-MARKED or config-revised catalog is known
         // wrong (the upstream said so, or the integration's config changed), so
@@ -5824,41 +5821,31 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // Run the stale sync with a bounded wait: a read pays at most the grace
     // budget for upstream listings it did not ask for, then serves the
     // persisted catalog while the rebuilds finish on their detached fibers
-    // (deduplicated per connection by `produceConnectionTools`, so overlapping
-    // reads share one rebuild instead of stacking new ones). One slow or dead
+    // (deduplicated per connection by the queue and `produceConnectionTools`,
+    // so overlapping reads share one rebuild). One slow or dead
     // MCP server must never gate every catalog read behind its network
     // timeout. Past the deadline the sync is best-effort by construction —
     // failures log and the stale-but-working catalog stays — so the fork
     // swallows its scan errors the same way each rebuild already swallows its
     // own.
-    let staleSyncFiber: Fiber.Fiber<void> | null = null;
-    const startStaleSync = Effect.uninterruptibleMask((restore) =>
-      Effect.gen(function* () {
-        if (staleSyncFiber !== null) return staleSyncFiber;
-        const fiber = yield* Effect.forkDetach(
-          restore(syncStaleConnectionTools("bounded")).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                staleSyncFiber = null;
-              }),
-            ),
-            Effect.catch((error) =>
-              Effect.logWarning("executor stale tool sync scan failed", {
-                error: describeSyncFailure(error),
-              }),
-            ),
+    const startStaleSync = Effect.gen(function* () {
+      const fiber = yield* Effect.forkDetach(
+        syncStaleConnectionTools("bounded").pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("executor stale tool sync scan failed", {
+              error: describeSyncFailure(error),
+            }),
           ),
-        );
-        staleSyncFiber = fiber;
-        // On hosts that cancel request-scoped I/O once the response settles
-        // (Cloudflare Workers), hand the host the rebuilds' completion so the
-        // catalog still converges after the read stops waiting.
-        config.waitUntil?.(
-          new Promise<void>((resolve) => fiber.addObserver(() => resolve(undefined))),
-        );
-        return fiber;
-      }),
-    );
+        ),
+      );
+      // On hosts that cancel request-scoped I/O once the response settles
+      // (Cloudflare Workers), hand the host the rebuilds' completion so the
+      // catalog still converges after the read stops waiting.
+      config.waitUntil?.(
+        new Promise<void>((resolve) => fiber.addObserver(() => resolve(undefined))),
+      );
+      return fiber;
+    });
 
     // Restrict a tool-row read to the prefixes an allowlist policy source can
     // reach. `null` = no restriction; `false` = nothing reachable, skip the

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Fiber } from "effect";
+import { Deferred, Effect, Fiber, Option } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -87,6 +87,58 @@ const makeFixture = (
   });
 
 describe("file-backed catalog refresh", () => {
+  it.live("discovers newly stale connections while an urgent discovery is held", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const discoveredB = yield* Deferred.make<void>();
+        let refreshing = false;
+        const discoveries: string[] = [];
+        const fixture = yield* makeFixture(
+          (name) =>
+            Effect.gen(function* () {
+              if (!refreshing) return catalog;
+              discoveries.push(name);
+              if (name === "a") {
+                yield* Deferred.succeed(started, undefined);
+                yield* Deferred.await(release);
+              } else {
+                yield* Deferred.succeed(discoveredB, undefined);
+              }
+              return { tools: [{ name: ToolName.make("updated") }] };
+            }),
+          { graceMs: 50 },
+        );
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(release, undefined).pipe(Effect.andThen(fixture.drain)),
+        );
+        yield* fixture.create("a");
+        yield* fixture.create("b");
+        refreshing = true;
+        yield* Effect.promise(() =>
+          fixture.config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "a"),
+            set: { tools_synced_at: null },
+          }),
+        );
+        yield* fixture.executor.tools.list();
+        yield* Deferred.await(started).pipe(Effect.timeout(2000));
+        yield* Effect.promise(() =>
+          fixture.config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "b"),
+            set: { tools_synced_at: null },
+          }),
+        );
+        yield* fixture.executor.tools.list();
+        expect(
+          Option.isSome(yield* Deferred.await(discoveredB).pipe(Effect.timeoutOption(2000))),
+        ).toBe(true);
+        expect(discoveries.slice().sort()).toEqual(["a", "b"]);
+      }),
+    ),
+  );
+
   it.live("keeps identical tool and definition rows while reads overlap reordered discovery", () =>
     Effect.scoped(
       Effect.gen(function* () {
