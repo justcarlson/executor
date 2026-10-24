@@ -93,6 +93,77 @@ const makeFixture = (
   });
 
 describe("file-backed catalog refresh", () => {
+  for (const { column, change, stored } of [
+    {
+      column: "description",
+      change: { description: "Changed description" },
+      stored: { description: "Changed description" },
+    },
+    {
+      column: "input_schema",
+      change: { inputSchema: { type: "string" } },
+      stored: { input_schema: { type: "string" } },
+    },
+    {
+      column: "output_schema",
+      change: { outputSchema: { type: "number" } },
+      stored: { output_schema: { type: "number" } },
+    },
+    {
+      column: "annotations",
+      change: { annotations: { requiresApproval: true } },
+      stored: { annotations: { requiresApproval: true } },
+    },
+  ]) {
+    it.live(`persists a changed tool ${column} with the same names and count`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          let listing = catalog;
+          const fixture = yield* makeFixture(() => Effect.succeed(listing));
+          yield* fixture.create("main");
+          const beforeTools = yield* Effect.promise(() => fixture.config.db.findMany("tool", {}));
+          listing = {
+            ...catalog,
+            tools: catalog.tools.map((tool) =>
+              tool.name === "list" ? { ...tool, ...change } : tool,
+            ),
+          };
+          yield* fixture.executor.connections.refresh(ref);
+          const tools = yield* Effect.promise(() => fixture.config.db.findMany("tool", {}));
+          expect(tools.map((tool) => tool.name).sort()).toEqual(
+            beforeTools.map((tool) => tool.name).sort(),
+          );
+          expect(tools.find((tool) => tool.name === "list")).toMatchObject(stored);
+          expect(
+            yield* Effect.promise(() => fixture.config.db.findMany("definition", {})),
+          ).toMatchObject([{ name: "Id", schema: { type: "string" } }]);
+        }),
+      ),
+    );
+  }
+
+  it.live("persists a changed definition schema with the same names and count", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let listing = catalog;
+        const fixture = yield* makeFixture(() => Effect.succeed(listing));
+        yield* fixture.create("main");
+        const beforeDefinitions = yield* Effect.promise(() =>
+          fixture.config.db.findMany("definition", {}),
+        );
+        listing = { ...catalog, definitions: { Id: { type: "number" } } };
+        yield* fixture.executor.connections.refresh(ref);
+        const definitions = yield* Effect.promise(() =>
+          fixture.config.db.findMany("definition", {}),
+        );
+        expect(definitions.map((definition) => definition.name)).toEqual(
+          beforeDefinitions.map((definition) => definition.name),
+        );
+        expect(definitions).toMatchObject([{ name: "Id", schema: { type: "number" } }]);
+      }),
+    ),
+  );
+
   it.live("settles every queued batch when a shared discovery is interrupted", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -203,6 +274,14 @@ describe("file-backed catalog refresh", () => {
           Deferred.succeed(release, undefined).pipe(Effect.andThen(fixture.drain)),
         );
         yield* fixture.create("main");
+        yield* Effect.promise(() =>
+          fixture.config.db.updateMany("tool", {
+            set: { created_at: new Date(0), updated_at: new Date(0) },
+          }),
+        );
+        yield* Effect.promise(() =>
+          fixture.config.db.updateMany("definition", { set: { created_at: new Date(0) } }),
+        );
         const beforeTools = yield* Effect.promise(() => fixture.config.db.findMany("tool", {}));
         const beforeDefinitions = yield* Effect.promise(() =>
           fixture.config.db.findMany("definition", {}),
