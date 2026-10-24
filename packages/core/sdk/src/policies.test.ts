@@ -969,18 +969,16 @@ describe("tools.schema policy read", () => {
         const lean = yield* executor.tools.schema(address, { typeScript: false });
         expect(full !== null).toBe(visible.has(String(address)));
         expect(lean !== null).toBe(visible.has(String(address)));
-        if (full && lean) {
-          expect(lean.inputTypeScript).toBeUndefined();
-          expect(lean.outputTypeScript).toBeUndefined();
-          expect(lean.typeScriptDefinitions).toBeUndefined();
-          const {
-            inputTypeScript: _i,
-            outputTypeScript: _o,
-            typeScriptDefinitions: _d,
-            ...rest
-          } = full;
-          expect({ ...lean }).toEqual(rest);
-        }
+        expect(lean?.inputTypeScript).toBeUndefined();
+        expect(lean?.outputTypeScript).toBeUndefined();
+        expect(lean?.typeScriptDefinitions).toBeUndefined();
+        const {
+          inputTypeScript: _i,
+          outputTypeScript: _o,
+          typeScriptDefinitions: _d,
+          ...rest
+        } = full ?? {};
+        expect(lean && { ...lean }).toEqual(full && rest);
       }
       expect([...visible].sort()).toEqual([String(addr(VERCEL, "deploy"))]);
     }),
