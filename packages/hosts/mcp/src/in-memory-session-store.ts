@@ -72,10 +72,10 @@ import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./too
 // answers; a POST carrying just the `notifications/initialized` notification
 // still gets a bare 202, which is exactly the cue the client SDK uses to open
 // the long-lived `GET /mcp` stream. So essentially every session holds an open
-// server-to-client stream for its whole life. That stream is silent by design
-// (it exists for server-initiated messages) and this transport does no max-age
-// rotation, so it produces no recurring request to stamp against — an open
-// stream tells us the socket is up, never that the peer is still working.
+// server-to-client stream for its whole life. After its opening comment, the
+// stream carries keepalive comments and server-initiated messages. This transport
+// does no max-age rotation, so it produces no recurring request to stamp against.
+// An open stream tells us the socket is up, never that the peer is still working.
 //
 // So the store treats a session as abandoned once it has gone `idleTtlMs`
 // without a REQUEST and disposes it, open stream or not. That mirrors cloud's
@@ -88,6 +88,7 @@ import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./too
 // loses its stream at the ceiling and re-initializes on its next call.
 /** Idle window after which an untouched session is evicted. */
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
+const STREAM_KEEPALIVE_INTERVAL_MS = 25_000;
 /** Floor on the sweep interval, so a small TTL cannot spin the timer. */
 const MIN_SWEEP_INTERVAL_MS = 30 * 1000;
 
@@ -372,6 +373,40 @@ export const makeInMemoryMcpSessionStore = (
             transport.handleRequest(withOrgWriteAccess(request, orgWriteAccess)),
           );
     return handle.pipe(
+      Effect.map((response) => {
+        if (
+          request.method !== "GET" ||
+          response.status !== 200 ||
+          !response.headers.get("content-type")?.startsWith("text/event-stream") ||
+          !response.body
+        )
+          return response;
+        let pingTimer: ReturnType<typeof setInterval> | undefined;
+        const clearPing = (): void => {
+          if (pingTimer !== undefined) clearInterval(pingTimer);
+        };
+        const encoder = new TextEncoder();
+        const transformer = {
+          start: (controller: TransformStreamDefaultController<Uint8Array>) => {
+            // A first chunk lets HTTP servers flush the SSE headers before any event.
+            controller.enqueue(encoder.encode(": connected\n\n"));
+            pingTimer = setInterval(() => {
+              // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: enqueue throws after stream cancellation on runtimes without transformer cancel
+              try {
+                controller.enqueue(encoder.encode(": ping\n\n"));
+              } catch {
+                clearPing();
+              }
+            }, STREAM_KEEPALIVE_INTERVAL_MS);
+          },
+          flush: clearPing,
+          cancel: clearPing,
+        };
+        return new Response(
+          response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>(transformer)),
+          response,
+        );
+      }),
       Effect.tap(() => Effect.sync(finish)),
       Effect.catchCause((cause) =>
         Effect.sync(() => {

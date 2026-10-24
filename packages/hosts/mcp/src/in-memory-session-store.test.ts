@@ -1,5 +1,5 @@
-import { describe, expect, it } from "@effect/vitest";
-import { Effect, type Cause } from "effect";
+import { afterEach, beforeEach, describe, expect, it, vi } from "@effect/vitest";
+import { Effect, Option, type Cause } from "effect";
 
 import type { ExecutionEngine } from "@executor-js/execution";
 import { FormElicitation, ToolAddress, createExecutor } from "@executor-js/sdk";
@@ -598,7 +598,7 @@ const dispatchPost = (
         }),
         principal: TEST_PRINCIPAL,
         resource: defaultMcpResource,
-        sessionId: null,
+        sessionId: headers["mcp-session-id"] ?? null,
         method: "POST",
       })
       .pipe(
@@ -775,5 +775,146 @@ describe("pre-initialize dispatch through the in-memory session store", () => {
     await sessions.close();
     expect(executorClosed).toBe(1);
     expect(sessions.sessionCount()).toBe(0);
+  });
+});
+
+it.live("starts an initialized session GET stream within one second", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { sessions } = yield* Effect.acquireRelease(
+        Effect.sync(makeServingStore),
+        ({ sessions }) => Effect.promise(() => sessions.close()),
+      );
+      const sessionId = yield* Effect.promise(() => openSession(sessions));
+      const notification = yield* Effect.promise(() =>
+        dispatchPost(
+          sessions,
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { ...MCP_POST_HEADERS, "mcp-session-id": sessionId },
+        ),
+      );
+      expect(notification.status).toBe(202);
+      const response = yield* sessions.store.dispatch({
+        request: new Request("https://executor.test/mcp?mode=passthrough", {
+          headers: { accept: "text/event-stream", "mcp-session-id": sessionId },
+        }),
+        principal: TEST_PRINCIPAL,
+        resource: defaultMcpResource,
+        sessionId,
+        method: "GET",
+      });
+      if (!(response instanceof Response)) return yield* Effect.fail("Expected HTTP response");
+      expect(response.status).toBe(200);
+      expect(response.headers.get("content-type")).toContain("text/event-stream");
+      const body = response.body;
+      if (!body) return yield* Effect.fail("Expected SSE body");
+      const reader = yield* Effect.acquireRelease(
+        Effect.sync(() => body.getReader()),
+        (reader) => Effect.promise(() => reader.cancel()),
+      );
+      const first = yield* Effect.promise(() => reader.read()).pipe(Effect.timeoutOption(1_000));
+      expect(Option.isSome(first)).toBe(true);
+      expect(Option.map(first, (chunk) => new TextDecoder().decode(chunk.value))).toEqual(
+        Option.some(": connected\n\n"),
+      );
+    }),
+  ),
+);
+
+describe("standalone GET stream keepalive", () => {
+  let sessions: TestSessionStore;
+  let timersBeforeStore: number;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    timersBeforeStore = vi.getTimerCount();
+    sessions = makeServingStore().sessions;
+  });
+
+  afterEach(async () => {
+    await sessions.close();
+    vi.useRealTimers();
+  });
+
+  const getStream = (sessionId: string, method: "GET" | "DELETE" = "GET") =>
+    Effect.runPromise(
+      sessions.store
+        .dispatch({
+          request: new Request("https://executor.test/mcp", {
+            method,
+            headers: { accept: "text/event-stream", "mcp-session-id": sessionId },
+          }),
+          principal: TEST_PRINCIPAL,
+          resource: defaultMcpResource,
+          sessionId,
+          method,
+        })
+        .pipe(
+          Effect.flatMap((response) =>
+            response instanceof Response
+              ? Effect.succeed(response)
+              : Effect.fail("Expected HTTP response"),
+          ),
+        ),
+    );
+
+  const openStream = async (sessionId: string) => {
+    const response = await getStream(sessionId);
+    expect(response.status).toBe(200);
+    const reader = await Effect.runPromise(
+      response.body ? Effect.succeed(response.body.getReader()) : Effect.fail("Expected SSE body"),
+    );
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(": connected\n\n");
+    return reader;
+  };
+
+  it("sends a ping comment after 25 seconds", async () => {
+    const sessionId = await openSession(sessions);
+    const timersBeforeGet = vi.getTimerCount();
+    const reader = await openStream(sessionId);
+    expect(vi.getTimerCount()).toBe(timersBeforeGet + 1);
+
+    const next = reader.read();
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(new TextDecoder().decode((await next).value)).toBe(": ping\n\n");
+    const following = reader.read();
+    await vi.advanceTimersByTimeAsync(25_000);
+    expect(new TextDecoder().decode((await following).value)).toBe(": ping\n\n");
+    await reader.cancel();
+  });
+
+  it("clears its ping timer and permits a second GET after cancellation", async () => {
+    const sessionId = await openSession(sessions);
+    const timersBeforeGet = vi.getTimerCount();
+    const reader = await openStream(sessionId);
+    expect(vi.getTimerCount()).toBe(timersBeforeGet + 1);
+
+    await reader.cancel();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(timersBeforeGet);
+    const reopened = await openStream(sessionId);
+    await reopened.cancel();
+  });
+
+  it("clears its ping timer when the source closes", async () => {
+    const sessionId = await openSession(sessions);
+    const timersBeforeGet = vi.getTimerCount();
+    const reader = await openStream(sessionId);
+    expect(vi.getTimerCount()).toBe(timersBeforeGet + 1);
+
+    expect((await getStream(sessionId, "DELETE")).status).toBe(200);
+    expect(await reader.read()).toEqual({ done: true, value: undefined });
+    expect(vi.getTimerCount()).toBe(timersBeforeGet);
+  });
+
+  it("clears its ping timer when the store closes", async () => {
+    const sessionId = await openSession(sessions);
+    const timersBeforeGet = vi.getTimerCount();
+    const reader = await openStream(sessionId);
+    expect(vi.getTimerCount()).toBe(timersBeforeGet + 1);
+
+    await sessions.close();
+    expect(await reader.read()).toEqual({ done: true, value: undefined });
+    expect(vi.getTimerCount()).toBe(timersBeforeStore);
   });
 });
