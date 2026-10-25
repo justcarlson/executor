@@ -1,6 +1,6 @@
 # Tool usage metrics
 
-Self-host records authenticated `search`, `invoke`, `integrations`, `skills`,
+With `tool-usage` enabled, self-host records authenticated `search`, `invoke`, `integrations`, `skills`,
 and `execute` MCP calls. Every repeated call counts, including validation
 errors and denied invokes. An `execute` call records one row per distinct
 connected tool the sandbox attempted, capped at 32 targets in first-call order

@@ -1,3 +1,5 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
+import { searchAliasContext } from "./integration-aliases";
 import { Effect, Predicate } from "effect";
 import * as Cause from "effect/Cause";
 import type {
@@ -19,7 +21,6 @@ import {
 } from "@executor-js/sdk/core";
 import type { SandboxToolInvoker } from "@executor-js/codemode-core";
 import { ExecutionToolError } from "./errors";
-import { integrationAliasText, resolveIntegrationAlias } from "./integration-aliases";
 
 const OPAQUE_DEFECT_MESSAGE = "Internal tool error";
 const TOOL_DESCRIBE_SUGGESTION_LIMIT = 5;
@@ -317,7 +318,6 @@ export const makeExecutorToolInvoker = (
   options: {
     readonly invokeOptions: InvokeOptions;
     readonly onConnectedToolCall?: (path: string) => void;
-    readonly onConnectedToolOutcome?: (path: string, status: "ok" | "error" | "blocked") => void;
   },
 ): SandboxToolInvoker => ({
   invoke: Effect.fn("mcp.tool.dispatch")(function* ({ path, args }) {
@@ -327,17 +327,6 @@ export const makeExecutorToolInvoker = (
     });
 
     const address = pathToAddress(path);
-    // Telemetry accepts identifiers only, even when the sandbox supplies a malformed path.
-    const telemetryPath =
-      String(address).length <= 512 &&
-      /^tools\.[a-zA-Z0-9_-]{1,64}\.(?:org|user)\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_.-]+$/.test(
-        String(address),
-      )
-        ? addressToPath(String(address))
-        : undefined;
-    const reportOutcome = (status: "ok" | "error" | "blocked") => {
-      if (telemetryPath) options.onConnectedToolOutcome?.(telemetryPath, status);
-    };
     const result = yield* executor.execute(address, args, options.invokeOptions).pipe(
       Effect.catchTag("CredentialResolutionError", (err) =>
         Effect.succeed(
@@ -356,7 +345,6 @@ export const makeExecutorToolInvoker = (
           return Effect.succeed(ToolResult.fail(expected));
         }
         if (isElicitationDeclinedError(err)) {
-          reportOutcome("blocked");
           return Effect.fail(
             new ExecutionToolError({
               message: `Tool "${addressToPath(String(err.address))}" requires approval but the request was ${err.action === "cancel" ? "cancelled" : "declined"} by the user.`,
@@ -370,7 +358,6 @@ export const makeExecutorToolInvoker = (
         // can't leak through Error.message into the sandbox. The full
         // cause is logged with the same correlation id so operators can
         // still trace the failure.
-        reportOutcome("error");
         const correlationId = newCorrelationId();
         return Effect.logError("tool dispatch failed", cause).pipe(
           Effect.annotateLogs({
@@ -396,13 +383,6 @@ export const makeExecutorToolInvoker = (
     // Expected failures resolve through the success channel, so without the
     // outcome annotation the dispatch span reads as healthy even when the
     // caller hit an upstream error or auth wall.
-    reportOutcome(
-      !isToolResult(result) || result.ok
-        ? "ok"
-        : result.error.code === "tool_blocked"
-          ? "blocked"
-          : "error",
-    );
     yield* annotateToolResultOutcome(result);
     const connectedToolPath = parseToolAddress(String(address))
       ? addressToPath(String(address))
@@ -636,10 +616,6 @@ const scoreToolMatch = (
   }
 
   const path = prepareField(tool.path);
-  // The integration field carries the slug plus any alias text the caller
-  // knows for it (its display name), so a query word that names the
-  // integration the way a person would ("gmail", "Google Calendar") scores
-  // and counts toward coverage the same as the slug's own tokens.
   const alias = integrationAliases?.get(tool.integration);
   const integration = prepareField(alias ? `${tool.integration} ${alias}` : tool.integration);
   const name = prepareField(tool.name);
@@ -705,10 +681,6 @@ const scoreToolMatch = (
 export const searchTools = Effect.fn("executor.tools.search")(function* (
   executor: {
     readonly tools: Pick<Executor["tools"], "list">;
-    /** The integration catalog, when the caller has one. With it, `namespace`
-     *  accepts an unambiguous alias (`gmail` → `google_gmail`) and query words
-     *  that name an integration by display name rank its tools. Passthrough
-     *  resolves both before calling and passes a discovery object without it. */
     readonly integrations?: Pick<Executor["integrations"], "list">;
   },
   query: string,
@@ -716,8 +688,7 @@ export const searchTools = Effect.fn("executor.tools.search")(function* (
   options?: {
     readonly namespace?: string;
     readonly offset?: number;
-    /** Extra searchable text per integration slug (its display name), so
-     *  query words naming the integration rank its tools. */
+    readonly forkFeatures?: ForkFeatures;
     readonly integrationAliases?: ReadonlyMap<string, string>;
   },
 ) {
@@ -745,33 +716,17 @@ export const searchTools = Effect.fn("executor.tools.search")(function* (
     } satisfies PagedResult<ToolDiscoveryResult>;
   }
 
-  // The namespace an agent typed, resolved against the catalog when one is
-  // available: an unambiguous alias becomes the slug for both enumeration and
-  // ranked search. An exact slug, an ambiguous alias (`google` naming two
-  // integrations) and an unknown name keep today's token-prefix behaviour, so
-  // no existing result changes.
-  let namespace = hasNamespace ? options!.namespace!.trim() : undefined;
-  let integrationAliases = options?.integrationAliases;
-  if (executor.integrations !== undefined) {
-    const catalog = (yield* executor.integrations.list().pipe(
-      Effect.mapError(
-        (cause) =>
-          new ExecutionToolError({
-            message: "Failed to list integrations for search",
-            cause,
-          }),
-      ),
-    )).map((integration) => ({
-      slug: String(integration.slug),
-      name: integration.name,
-      description: integration.description,
-    }));
-    if (namespace !== undefined) {
-      const resolved = resolveIntegrationAlias(namespace, catalog);
-      if (resolved.kind === "alias") namespace = resolved.slug;
-    }
-    integrationAliases ??= integrationAliasText(catalog);
-  }
+  const aliases =
+    options?.forkFeatures?.has("integration-aliases") && executor.integrations
+      ? yield* searchAliasContext(
+          executor.integrations,
+          hasNamespace ? options?.namespace?.trim() : undefined,
+        )
+      : undefined;
+  const namespace = aliases ? aliases.namespace : options?.namespace;
+  const integrationAliases = options?.forkFeatures?.has("integration-aliases")
+    ? (options.integrationAliases ?? aliases?.integrationAliases)
+    : undefined;
 
   const all = yield* executor.tools.list({ includeAnnotations: false }).pipe(
     Effect.mapError(
@@ -794,7 +749,7 @@ export const searchTools = Effect.fn("executor.tools.search")(function* (
   // `executor.integrations.list`'s per-integration toolCount.
   const ranked: readonly ToolDiscoveryResult[] = emptyQuery
     ? searchable
-        .filter((tool) => tool.integration === namespace)
+        .filter((tool) => tool.integration === namespace?.trim())
         .sort((left, right) => left.path.localeCompare(right.path))
         .map((tool) => ({
           path: tool.path,

@@ -1,3 +1,4 @@
+export { withForkCodeExecutor } from "./fork-code-executor";
 export {
   createExecutionEngine,
   formatExecuteResult,
@@ -25,14 +26,14 @@ export {
   skillCatalogFor,
   type Skill,
 } from "./skills";
+export { PROVIDED_GLOBAL_NAMES } from "./provided-globals";
+export { ExecutionToolError } from "./errors";
 export {
   integrationAliasText,
   resolveIntegrationAlias,
   type IntegrationCatalogEntry,
   type IntegrationResolution,
 } from "./integration-aliases";
-export { PROVIDED_GLOBAL_NAMES } from "./provided-globals";
-export { ExecutionToolError } from "./errors";
 export {
   defaultToolDiscoveryProvider,
   makeExecutorToolInvoker,
@@ -44,3 +45,5 @@ export {
   type PagedResult,
   type ToolDiscoveryResult,
 } from "./tool-invoker";
+
+export { buildForkExecuteDescription } from "./fork-inventory";

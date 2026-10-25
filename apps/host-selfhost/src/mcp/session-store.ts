@@ -1,4 +1,5 @@
-import { Effect, Layer } from "effect";
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
+import { Layer } from "effect";
 
 import { makeConsoleMcpErrorReporter, makeMcpBuildServer } from "@executor-js/api/server";
 import type { McpErrorReporter } from "@executor-js/host-mcp";
@@ -8,12 +9,11 @@ import {
   type InMemoryMcpSessionStore,
 } from "@executor-js/host-mcp/in-memory-session-store";
 
+import { makeToolUsageSessionStore } from "./tool-usage-sessions";
 import { selfHostAnalytics } from "../analytics";
 import { ErrorCaptureLive } from "../observability";
 import { SelfHostDb, type SelfHostDbHandle } from "../db/self-host-db";
-import { SelfHostExecutionStackLayer } from "../execution";
-import { makeToolUsageRecorder } from "./tool-usage-store";
-import { observeToolUsageServer } from "./tool-usage";
+import { makeSelfHostExecutionStackLayer } from "../fork-execution";
 
 // ---------------------------------------------------------------------------
 // Self-host McpSessionStore wiring. The store body (Maps, dispatch, ownership,
@@ -39,41 +39,29 @@ export const makeSelfHostMcpSessionStore = (
   db: SelfHostDbHandle,
   webBaseUrl?: string,
   sessionIdleTtlMs?: number,
-): InMemoryMcpSessionStore => {
-  const usage = makeToolUsageRecorder(db.client);
-  const build = makeMcpBuildServer(
-    SelfHostExecutionStackLayer.pipe(Layer.provide(Layer.succeed(SelfHostDb)(db))),
-    {
-      loadAppShellHtml: loadMcpAppsShellHtml,
-      smokeRenderArtifact,
-      onArtifactUsage: (action) => selfHostAnalytics.record(`artifact_${action}`, { via: "agent" }),
-    },
-  );
-  const store = makeInMemoryMcpSessionStore(
-    (principal, options) =>
-      Effect.promise(() => usage.ready).pipe(
-        Effect.flatMap(() => build(principal, options)),
-        Effect.tap(({ mcpServer }) =>
-          Effect.sync(() => {
-            const memberHash = usage.memberHash(principal.organizationId, principal.accountId);
-            if (memberHash !== null)
-              observeToolUsageServer(mcpServer, memberHash, usage.record, usage.drop);
-          }),
-        ),
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+): InMemoryMcpSessionStore =>
+  (forkFeatures.has("tool-usage")
+    ? makeToolUsageSessionStore(db.client)
+    : makeInMemoryMcpSessionStore)(
+    makeMcpBuildServer(
+      makeSelfHostExecutionStackLayer(forkFeatures).pipe(
+        Layer.provide(Layer.succeed(SelfHostDb)(db)),
       ),
+      {
+        loadAppShellHtml: loadMcpAppsShellHtml,
+        smokeRenderArtifact,
+        // Artifact operations on the MCP plane come from an agent's tools.
+        onArtifactUsage: (action) =>
+          selfHostAnalytics.record(`artifact_${action}`, { via: "agent" }),
+      },
+    ),
     {
+      forkFeatures,
       ...(webBaseUrl === undefined ? {} : { webBaseUrl }),
       ...(sessionIdleTtlMs === undefined ? {} : { sessionIdleTtlMs }),
     },
   );
-  return {
-    ...store,
-    close: async () => {
-      await store.close();
-      await usage.close();
-    },
-  };
-};
 
 /** The `McpSessionStore` envelope seam over a freshly built in-process store. */
 export const selfHostMcpSessions = inMemoryMcpSessionsLayer;

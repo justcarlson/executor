@@ -44,56 +44,6 @@ const emptyPlugin = definePlugin(() => ({
 
 const makeExecutor = () => createExecutor(makeTestConfig({ plugins: [emptyPlugin()] as const }));
 
-describe("automatic attachment delivery through the execution engine", () => {
-  for (const mode of ["inline", "pausable", "operator"] as const) {
-    it.effect(`delivers native content in ${mode} mode without emit`, () =>
-      Effect.gen(function* () {
-        const image = { type: "image", mimeType: "image/gif", data: "R0lGODlh" };
-        const plugin = definePlugin(() => ({
-          id: "attachment-test" as const,
-          storage: () => ({}),
-          staticIntegrations: () => [
-            {
-              id: "delivery.files",
-              kind: "in-memory" as const,
-              name: "Files",
-              tools: [
-                tool({
-                  name: "render",
-                  description: "Render an attachment.",
-                  inputSchema: Schema.toStandardSchemaV1(
-                    Schema.toStandardJSONSchemaV1(Schema.Struct({})),
-                  ),
-                  execute: () => Effect.succeed({ content: [image] }),
-                }),
-              ],
-            },
-          ],
-        }));
-        const executor = yield* createExecutor(makeTestConfig({ plugins: [plugin()] as const }));
-        const engine = createExecutionEngine({ executor, codeExecutor: makeQuickJsExecutor() });
-        yield* Effect.addFinalizer(() =>
-          engine.shutdown.pipe(Effect.andThen(executor.close()), Effect.ignore),
-        );
-        const code = "return await tools.delivery.files.render({});";
-        const result =
-          mode === "inline"
-            ? yield* engine.execute(code, {
-                onElicitation: () => Effect.succeed({ action: "accept" }),
-              })
-            : yield* engine.executeWithPause(code, { autoApprove: mode === "operator" });
-        const completed =
-          "status" in result && result.status === "completed" ? result.result : result;
-        expect(completed).toMatchObject({ output: [{ type: "content", content: image }] });
-        expect(JSON.stringify(completed)).toContain("attachment");
-        expect(JSON.stringify("result" in completed ? completed.result : null)).not.toContain(
-          image.data,
-        );
-      }).pipe(Effect.scoped),
-    );
-  }
-});
-
 describe("executeWithPause failure propagation", () => {
   it.effect("surfaces a fast codeExecutor failure as an Exit.Failure", () =>
     Effect.gen(function* () {
@@ -400,79 +350,20 @@ describe("formatExecuteResult output identity", () => {
       status: "completed",
       result: { issues: [] },
       toolName: "linear.org.work.issues.list",
-      toolPaths: ["linear.org.work.issues.list"],
       logs: [],
     });
   });
 
-  it("omits a tool name but lists distinct paths in first-call order when several tools were used", () => {
+  it("omits a tool name when distinct connected tools were used", () => {
     const result = {
       result: { issues: [], projects: [] },
       logs: [],
-      toolPaths: [
-        "linear.org.work.projects.list",
-        "linear.org.work.issues.list",
-        "linear.org.work.projects.list",
-      ],
+      toolPaths: ["linear.org.work.issues.list", "linear.org.work.projects.list"],
     } as ExecuteResult & { readonly toolPaths: readonly string[] };
 
     const formatted = formatExecuteResult(result);
 
     expect(formatted.structured).not.toHaveProperty("toolName");
-    expect(formatted.structured["toolPaths"]).toEqual([
-      "linear.org.work.projects.list",
-      "linear.org.work.issues.list",
-    ]);
-  });
-
-  it("omits tool paths when no connected tool was called", () => {
-    const formatted = formatExecuteResult({ result: 1, logs: [], toolPaths: [] });
-
-    expect(formatted.structured).not.toHaveProperty("toolPaths");
-    expect(formatted.structured).not.toHaveProperty("toolName");
-  });
-
-  it("retains successful paths and outcome identifiers in script-error envelopes", () => {
-    const formatted = formatExecuteResult({
-      result: null,
-      error: "script-secret",
-      logs: ["log-secret"],
-      toolPaths: ["sample.org.main.read"],
-      toolCalls: [{ path: "sample.org.main.read", status: "ok" }],
-    });
-    expect(formatted.isError).toBe(true);
-    expect(formatted.structured).toMatchObject({
-      status: "error",
-      toolPaths: ["sample.org.main.read"],
-      toolCalls: [{ path: "sample.org.main.read", status: "ok" }],
-    });
-    expect(formatted.structured).not.toHaveProperty("toolName");
-  });
-
-  it("caps outcome identifiers and reduces repeats after the cap without retaining extra fields", () => {
-    const calls = Array.from({ length: 35 }, (_, index) => ({
-      path: `sample.org.main.read${index}`,
-      status: "ok" as const,
-      args: "argument-secret",
-      result: "result-secret",
-      error: "error-secret",
-    }));
-    const formatted = formatExecuteResult({
-      result: null,
-      toolCalls: [
-        ...calls,
-        { path: "sample.org.main.read0", status: "error" },
-        { path: "tools.sample.org.main.read0", status: "blocked" },
-        { path: "sample.org.main.read0", status: "ok" },
-        { path: "bearer secret@example.test", status: "error" },
-        { path: "sample.org.main." + "x".repeat(512), status: "error" },
-      ],
-    });
-    expect(formatted.structured["toolCalls"]).toEqual([
-      { path: "sample.org.main.read0", status: "blocked" },
-      ...calls.slice(1, 32).map(({ path, status }) => ({ path, status })),
-    ]);
-    expect(JSON.stringify(formatted.structured)).not.toMatch(/secret|args|error/);
   });
 
   it("truncates a long preview with the exact suffix and untouched structured value", () => {

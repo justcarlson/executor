@@ -23,7 +23,7 @@ export {
   type PluginExtensionServices,
 } from "./plugin-routes";
 export { AccountProvider, type AccountProviderShape, type AccountHeaders } from "./account/service";
-export { AccountHandlers } from "./account/handlers";
+export { AccountHandlers } from "./account/fork-account-api";
 export {
   AdminUsersProvider,
   type AdminUsersProviderShape,

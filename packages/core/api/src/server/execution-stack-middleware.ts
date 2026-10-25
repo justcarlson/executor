@@ -83,7 +83,8 @@ export interface FailureRenderingStrategy<E, RR = never> {
  * Self-host's strategy: this is an `HttpRouter` middleware (not an `HttpApi`
  * endpoint), so a failed typed error would surface as a 500 — recover
  * `Unauthorized` -> 401 text and `NoOrganization` -> 403 text instead. Self-host
- * recovers `Unavailable` to 503 text so transient lookup failures can be retried.
+ * never produces `Unavailable`, but the shared channel now includes it, so it is
+ * recovered to a 503 text for total coverage.
  */
 export const textFailureStrategy: FailureRenderingStrategy<IdentityFailure> = {
   renderFailure: (effect) =>

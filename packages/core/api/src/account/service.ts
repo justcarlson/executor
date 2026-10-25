@@ -1,8 +1,8 @@
+import type { AccountUnavailable } from "./fork-membership-errors";
 import { Context, type Effect } from "effect";
 
 import {
   type AccountError,
-  type AccountUnavailable,
   type AccountForbidden,
   type AccountNoOrganization,
   type AccountUnauthorized,

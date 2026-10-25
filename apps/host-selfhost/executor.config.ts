@@ -1,3 +1,4 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { defineExecutorConfig } from "@executor-js/sdk";
 import { openApiHttpPlugin } from "@executor-js/plugin-openapi/api";
 import {
@@ -26,6 +27,7 @@ import { resolveSecretKey } from "./src/config";
 // ---------------------------------------------------------------------------
 
 interface SelfHostPluginDeps {
+  readonly forkFeatures?: ForkFeatures;
   readonly activeToolkitSlug?: string;
   /** Accepted for test-harness parity; the Microsoft Graph URL override moved
    *  into the OpenAPI provider presets, so the factory no longer reads it. */
@@ -33,7 +35,7 @@ interface SelfHostPluginDeps {
 }
 
 export default defineExecutorConfig({
-  plugins: ({ activeToolkitSlug }: SelfHostPluginDeps = {}) =>
+  plugins: ({ activeToolkitSlug, forkFeatures = forkFeaturesOff }: SelfHostPluginDeps = {}) =>
     [
       openApiHttpPlugin({
         presets: [...googleCatalog, ...microsoftCatalog],
@@ -45,6 +47,9 @@ export default defineExecutorConfig({
       graphqlHttpPlugin(),
       toolkitsPlugin({ activeToolkitSlug }),
       // First writable secret provider -> the default for `secrets.set`.
-      encryptedSecretsPlugin({ key: resolveSecretKey() }),
+      encryptedSecretsPlugin({
+        key: resolveSecretKey(),
+        reuseDerivedKey: forkFeatures.has("secret-key-cache"),
+      }),
     ] as const,
 });

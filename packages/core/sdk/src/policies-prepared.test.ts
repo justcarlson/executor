@@ -1,7 +1,8 @@
 import { describe, expect, it } from "@effect/vitest";
 
 import { type ToolPolicyRow } from "./core-schema";
-import { prepareToolPolicies, resolveEffectivePolicy, resolveToolPolicy } from "./policies";
+import { resolveEffectivePolicy, resolveToolPolicy } from "./policies";
+import { prepareToolPolicies } from "./fork-prepared-policies";
 
 // ---------------------------------------------------------------------------
 // `prepareToolPolicies` must return exactly what the per-tool resolvers return.

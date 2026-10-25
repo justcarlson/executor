@@ -1,15 +1,16 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
+import { findInstanceMembership } from "../auth/membership";
 import { Effect, Layer } from "effect";
 
 import { AccountProvider, type AccountHeaders } from "@executor-js/api/server";
 import {
   AccountError,
-  AccountNoOrganization,
   AccountUnauthorized,
+  AccountNoOrganization,
   AccountUnavailable,
 } from "@executor-js/api";
 
 import { BetterAuth } from "../auth/better-auth";
-import { findInstanceMembership } from "../auth/membership";
 
 // ---------------------------------------------------------------------------
 // Self-host AccountProvider â€” implements the provider-neutral account surface
@@ -40,7 +41,9 @@ const masked = (start: string | null | undefined): string => (start ? `${start}â
 const orgRole = (slug: string | undefined): "owner" | "admin" | "member" =>
   slug === "owner" ? "owner" : slug === "admin" ? "admin" : "member";
 
-export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, BetterAuth> =
+export const makeBetterAuthAccountProvider = (
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+): Layer.Layer<AccountProvider, never, BetterAuth> =>
   Layer.effect(AccountProvider)(
     Effect.gen(function* () {
       const betterAuth = yield* BetterAuth;
@@ -52,9 +55,6 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           catch: () => new AccountError({ message: "Failed to resolve session" }),
         }).pipe(Effect.orElseSucceed(() => null));
 
-      // Native Better Auth routes can mint credentials without a membership
-      // check. Every use of a credential is checked for current membership.
-      // These account routes also check membership before managing API keys.
       const requireMember = (headers: AccountHeaders) =>
         Effect.gen(function* () {
           const resolved = yield* getSession(headers);
@@ -71,6 +71,10 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           if (!membership) return yield* new AccountNoOrganization();
           return resolved;
         });
+      const checkMembership = (headers: AccountHeaders) =>
+        forkFeatures.has("current-membership")
+          ? Effect.asVoid(requireMember(headers))
+          : Effect.void;
 
       // Run a Better Auth api call, mapping any rejection to a neutral
       // AccountError with a stable, user-facing message.
@@ -80,13 +84,14 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
       return AccountProvider.of({
         me: (headers) =>
           Effect.gen(function* () {
-            // `me` declares no NoOrganization in its contract: a removed
-            // member is simply no longer signed in to this instance (401).
-            const resolved = yield* requireMember(headers).pipe(
-              Effect.catchTag("AccountNoOrganization", () =>
-                Effect.fail(new AccountUnauthorized()),
-              ),
-            );
+            const resolved = yield* forkFeatures.has("current-membership")
+              ? requireMember(headers).pipe(
+                  Effect.catchTag("AccountNoOrganization", () =>
+                    Effect.fail(new AccountUnauthorized()),
+                  ),
+                )
+              : getSession(headers);
+            if (!resolved) return yield* new AccountUnauthorized();
             return {
               user: {
                 id: resolved.user.id,
@@ -103,7 +108,7 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           }),
 
         listApiKeys: (headers) =>
-          requireMember(headers).pipe(
+          checkMembership(headers).pipe(
             Effect.andThen(
               call("Failed to list API keys", () =>
                 auth.api.listApiKeys({ headers: toHeaders(headers) }),
@@ -122,7 +127,7 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           ),
 
         createApiKey: (headers, name) =>
-          requireMember(headers).pipe(
+          checkMembership(headers).pipe(
             Effect.andThen(
               call("Failed to create API key", () =>
                 auth.api.createApiKey({ body: { name }, headers: toHeaders(headers) }),
@@ -140,7 +145,7 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
           ),
 
         revokeApiKey: (headers, apiKeyId) =>
-          requireMember(headers).pipe(
+          checkMembership(headers).pipe(
             Effect.andThen(
               call("Failed to revoke API key", () =>
                 auth.api.deleteApiKey({ body: { keyId: apiKeyId }, headers: toHeaders(headers) }),
@@ -248,3 +253,5 @@ export const betterAuthAccountProvider: Layer.Layer<AccountProvider, never, Bett
       });
     }),
   );
+
+export const betterAuthAccountProvider = makeBetterAuthAccountProvider();

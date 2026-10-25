@@ -85,6 +85,7 @@ export interface EngineDecoratorShape {
  * side channel.
  */
 export interface EngineStackContext {
+  readonly executor: Executor;
   readonly mcpResource?: McpResource;
 }
 
@@ -139,15 +140,16 @@ export const makeExecutionStack = <
     const { decorate } = yield* EngineDecorator.asEffect().pipe(
       Effect.withSpan("executor.stack.decorator"),
     );
+    const { forkFeatures } = yield* HostConfig;
     const engine = yield* Effect.sync(() =>
       decorate(
-        createExecutionEngine({ executor, codeExecutor }),
+        createExecutionEngine({ executor, codeExecutor, forkFeatures }),
         {
           accountId,
           organizationId,
           organizationName,
         },
-        { mcpResource: options?.mcpResource },
+        { mcpResource: options?.mcpResource, executor },
       ),
     );
     return { executor, engine };

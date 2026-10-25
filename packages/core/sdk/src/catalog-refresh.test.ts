@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CATALOG_READER_WAIT_MS, createExecutor } from "./executor";
+import { parseForkFeatures } from "./fork-features";
 import { ConnectionName, IntegrationSlug, NO_AUTH_TEMPLATE, ToolName } from "./ids";
 import { definePlugin, type ResolveToolsResult } from "./plugin";
 import { makeTestConfig, memoryCredentialsPlugin } from "./testing";
@@ -67,8 +68,10 @@ const makeFixture = (
     });
     yield* Effect.addFinalizer(() => Effect.promise(() => config.testDb.close()));
     const completions: Promise<unknown>[] = [];
+    const forkFeatures = yield* parseForkFeatures({ explicitFeatures: "detached-catalog-refresh" });
     const executor = yield* createExecutor({
       ...config,
+      forkFeatures,
       toolsSyncGraceMs: options.graceMs,
       waitUntil: (promise) => completions.push(promise),
     });

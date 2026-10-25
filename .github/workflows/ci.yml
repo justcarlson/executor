@@ -22,10 +22,13 @@ env:
   EXECUTOR_DISABLE_ANALYTICS: "1"
   EXECUTOR_DISABLE_INTEGRATIONS_FETCH: "1"
 
+# Outside contributions are ported into the private repo, which runs the
+# checks there, so fork PRs skip CI here. Jobs that need `changes` skip with it.
 jobs:
   changes:
     name: Changed paths
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       desktop_smoke: ${{ github.event_name != 'pull_request' || steps.filter.outputs.desktop_smoke == 'true' }}
@@ -78,7 +81,8 @@ jobs:
 
   format:
     name: Format
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -101,7 +105,8 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -124,7 +129,8 @@ jobs:
 
   typecheck:
     name: Typecheck
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     env:
       TURBO_API: ${{ vars.TURBO_API }}
@@ -165,17 +171,18 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    # Run two independent packages at once and cap each Vitest process at two
-    # workers. This uses all 4 vCPUs without every nested runner seeing the
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 15
+    # Run eight independent packages at once and cap each Vitest process at two
+    # workers. This uses all 16 vCPUs without every nested runner seeing the
     # whole machine and oversubscribing it.
     env:
       TURBO_API: ${{ vars.TURBO_API }}
       TURBO_TEAM: ${{ vars.TURBO_TEAM }}
       TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
       TURBO_REMOTE_CACHE_SIGNATURE_KEY: ${{ secrets.TURBO_REMOTE_CACHE_SIGNATURE_KEY }}
-      TURBO_TEST_CONCURRENCY: 2
+      TURBO_TEST_CONCURRENCY: 8
       VITEST_MAX_WORKERS: 2
     steps:
       - uses: actions/checkout@v4
@@ -253,7 +260,7 @@ jobs:
           # lane from the two-minute critical path.
           - { target: local, shard-index: 1, shard-name: 1of2 }
           - { target: local, shard-index: 2, shard-name: 2of2 }
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -288,7 +295,7 @@ jobs:
 
       # Install from e2e so bunx resolves ITS pinned playwright (the version
       # the tests run against) rather than floating to the latest.
-      # GitHub's Ubuntu image carries the browser system
+      # Blacksmith's Ubuntu image carries the official GitHub runner system
       # dependencies. Restore the pinned browser binaries without apt-updating
       # every matrix machine.
       - name: Install Playwright Chromium
@@ -329,7 +336,7 @@ jobs:
     name: Cloud evaluated closure
     needs: changes
     if: needs.changes.outputs.cloud_closure == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
       TURBO_API: ${{ vars.TURBO_API }}
@@ -373,7 +380,7 @@ jobs:
     name: Desktop smoke build
     needs: changes
     if: needs.changes.outputs.desktop_smoke == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -456,16 +463,16 @@ jobs:
     name: Self-host Docker image
     needs: changes
     if: needs.changes.outputs.selfhost_docker_smoke == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Setup Blacksmith Builder
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Build self-host image
-        uses: docker/build-push-action@v6
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: apps/host-selfhost/Dockerfile

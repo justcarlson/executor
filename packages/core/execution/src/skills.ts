@@ -13,6 +13,9 @@
  * genuinely needs its own how-to behind the same `skills` door.
  */
 
+import type { ForkFeatures } from "@executor-js/sdk/core";
+import { forkSkillCatalog } from "./fork-skill-guidance";
+
 export interface Skill {
   /** Stable identifier the model passes to the `skills` tool. */
   readonly name: string;
@@ -32,26 +35,27 @@ const EXECUTE_SKILL_BODY = [
   "",
   "## Workflow",
   "",
-  '1. `const { items: matches } = await tools.search({ query: "<intent + key nouns>", namespace: "<integration slug or alias>", limit: 3 });` — omit `namespace` when the integration is unknown.',
+  '1. `const { items: matches } = await tools.search({ query: "<intent + key nouns>", limit: 12 });`',
   '2. `const path = matches[0]?.path; if (!path) return "No matching tools found.";`',
-  "3. Only when the argument shape is unknown: `const details = await tools.describe.tool({ path });` and use `details.inputTypeScript` / `details.outputTypeScript` and `details.typeScriptDefinitions` for compact shapes.",
-  "4. For live saved-connection inventory, call `tools.executor.coreTools.connections.list({})`; after checking `result.ok`, read `result.data.connections`.",
-  "5. Call the tool: `const result = await tools[path](input);`",
+  "3. `const details = await tools.describe.tool({ path });`",
+  "4. Use `details.inputTypeScript` / `details.outputTypeScript` and `details.typeScriptDefinitions` for compact shapes.",
+  "5. For live saved-connection inventory, call `tools.executor.coreTools.connections.list({})`; after checking `result.ok`, read `result.data.connections`.",
+  "6. Call the tool: `const result = await tools.<path>(input);`",
   "",
   "## Rules",
   "",
   "- `tools.search()` returns paginated, ranked matches: `{ items, total, hasMore, nextOffset }`. Best-first. Use short intent phrases like `github issues`, `repo details`, or `create calendar event`.",
-  '- When you already know the integration, narrow with `tools.search({ namespace: "github", query: "issues", limit: 3 })`. `namespace` accepts the slug or an unambiguous alias (`gmail` resolves to `google_gmail`); an alias that fits several integrations is used as a prefix instead.',
+  '- When you already know the namespace, narrow with `tools.search({ namespace: "github", query: "issues" })`.',
   "- `tools.executor.coreTools.connections.list({})` returns saved connections with `{ address, integration, owner, name, ... }`. The `address` field includes the leading `tools.` root.",
   "- Tool calls return a value union: `{ ok: true, data }` for success or `{ ok: false, error: { code, message, status?, details?, retryable? } }` for expected tool/domain failures. Branch on `result.ok`.",
   "- `data` is the upstream payload itself. HTTP-backed tools (OpenAPI) also set `http: { status, headers }` beside `data` — read `result.http?.headers` for pagination (Link) or rate-limit headers.",
   "- Use `emit(value)` to append user-visible output. Plain values become MCP text content. MCP content blocks are forwarded as-is. `ToolFile` values are rendered by MIME. Emitting and returning compose: emitted items come first in the tool result, the returned value follows, and the envelope reports an `emitted` count so you can confirm the items landed.",
-  '- File-returning tools may return `ToolFile` values: `{ _tag: "ToolFile", name?, mimeType, encoding: "base64", data, byteLength }`. A "file-returning tool" includes APIs that return file bytes inside a JSON field, such as Base64-encoded `content`; wrap those payloads in a `ToolFile` and `emit()` them. Attachments are delivered automatically; no download or `emit()` is needed.',
+  '- File-returning tools may return `ToolFile` values: `{ _tag: "ToolFile", name?, mimeType, encoding: "base64", data, byteLength }`. A "file-returning tool" includes APIs that return file bytes inside a JSON field, such as Base64-encoded `content`; wrap those payloads in a `ToolFile` and `emit()` them. Emit any attachment with `emit(result.data)`.',
   "- Never decode or transcode bytes yourself — the sandbox has no `Buffer`, `atob`, `btoa`, `TextDecoder`, or `TextEncoder`. For base64-encoded bytes in a JSON field, wrap the payload in a `ToolFile` with its `mimeType` and `emit()` it; to forward them to an upload tool, pass the `ToolFile`'s base64 `data` as that tool's `bodyBase64` (both sides speak base64, so nothing is decoded).",
   '- To emit MCP-native content directly, pass an MCP content block to `emit(...)`, such as `{ type: "image", data, mimeType }`, `{ type: "audio", data, mimeType }`, `{ type: "text", text }`, `{ type: "resource", resource }`, or `{ type: "resource_link", uri, name, ... }`.',
   "- `emit(ToolFile)` is MIME-based: `image/*` becomes MCP image content, `audio/*` becomes MCP audio content, text-like files become decoded text, and other binary files become embedded MCP resources.",
-  "- Successful tool results containing `ToolFile` values or native MCP image, audio, or embedded binary resources are delivered automatically. Returned previews contain compact metadata instead of file bytes. Explicit `emit()` remains supported and attachments are deduplicated. A bare base64 string is ordinary data.",
-  "- Some providers, including Gmail, return attachment bytes as a `ToolFile` with no public URL to hand off — the bytes themselves are the payload. Executor delivers the attachment automatically; pass its base64 `data` as another tool's `bodyBase64` to forward it.",
+  "- `return` is only for ordinary structured data. Returning a `ToolFile`, a `ToolResult`, an MCP content block, or a bare base64 string does not emit content to the MCP client.",
+  "- Some providers, including Gmail, return attachment bytes as a `ToolFile` with no public URL to hand off — the bytes themselves are the payload, so `emit(result.data)` to display it, or pass its base64 `data` as another tool's `bodyBase64` to forward it.",
   "- If `tools.search()` returns `hasMore: true` and you didn't find what you need, fetch the next page: `tools.search({ query, offset: nextOffset, limit })`.",
   "- Always use the full address when calling tools: `tools.<integration>.<owner>.<connection>.<tool>(args)`. The `path` returned by `tools.search()` / `tools.describe.tool()` is already the exact path under `tools` — call `tools[path]` rather than guessing segments.",
   "- The `tools` object is a lazy proxy — enumerating it (`Object.keys(tools)`, spread, `for...in`) throws. Use `tools.search()` or `tools.executor.coreTools.connections.list({})` instead.",
@@ -650,6 +654,7 @@ const ARTIFACT_SKILLS: ReadonlySet<Skill> = new Set([CREATE_ARTIFACT_SKILL, ARTI
  * does not have; a session that opted in gets the full {@link SKILLS} list.
  */
 export const skillCatalogFor = (options: {
+  readonly forkFeatures?: ForkFeatures;
   readonly artifacts: boolean;
   readonly discovery?: "execute" | "search-invoke";
 }): readonly Skill[] => {
@@ -666,7 +671,10 @@ export const skillCatalogFor = (options: {
         ]
       : [];
   }
-  return options.artifacts ? SKILLS : SKILLS.filter((skill) => !ARTIFACT_SKILLS.has(skill));
+  return forkSkillCatalog(
+    options.artifacts ? SKILLS : SKILLS.filter((skill) => !ARTIFACT_SKILLS.has(skill)),
+    options.forkFeatures,
+  );
 };
 
 /** Look up a skill by its exact name within a session's catalog. */

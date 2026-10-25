@@ -42,6 +42,8 @@ import {
   type AuthorizeOrganizationOptions,
 } from "./organization";
 import { mcpSessionStub } from "@executor-js/cloudflare/mcp/session-stub";
+import { liveV2ImportSource, v2ImportAnswer } from "./v2-import";
+import { liveV2MovedSource } from "./v2-moved";
 
 const COOKIE_OPTIONS = {
   path: "/",
@@ -439,6 +441,18 @@ export const CloudSessionAuthHandlers = HttpApiBuilder.group(
           };
         }),
       )
+      .handle("v2Import", () =>
+        Effect.gen(function* () {
+          const session = yield* requireSelectedOrganization;
+          return yield* v2ImportAnswer({
+            env,
+            importSource: liveV2ImportSource,
+            movedSource: liveV2MovedSource,
+            userId: session.accountId,
+            organizationId: session.organizationId,
+          });
+        }),
+      )
       .handle("createOrganization", ({ payload }) =>
         Effect.gen(function* () {
           const workos = yield* WorkOSClient;
@@ -507,7 +521,7 @@ export const CloudSessionAuthHandlers = HttpApiBuilder.group(
               Effect.gen(function* () {
                 yield* Effect.logWarning(
                   "createOrganization: could not provision the Autumn customer",
-                  { organizationId: org.id, error },
+                  { organizationId: org.id },
                 );
                 yield* captureCauseEffect(error);
               }),
@@ -629,10 +643,10 @@ export const CloudSessionAuthHandlers = HttpApiBuilder.group(
                     { organizationId },
                   ),
               ),
-              Effect.tapError((error) =>
+              Effect.tapError(() =>
                 Effect.logError(
                   "deleteOrganization: org marked deleted but the Autumn customer could not be deleted; retry the deletion",
-                  { organizationId, error },
+                  { organizationId },
                 ),
               ),
               Effect.mapError(() => new OrganizationDeletionIncomplete({ step: "billing" })),
@@ -672,10 +686,10 @@ export const CloudSessionAuthHandlers = HttpApiBuilder.group(
               s.deleteOrganizationCascade(organizationId, deletedAt),
             )
             .pipe(
-              Effect.tapError((error) =>
+              Effect.tapError(() =>
                 Effect.logError(
                   "deleteOrganization: org marked deleted, removed from WorkOS and Autumn, but local purge failed, tenant data and secrets orphaned; retry the deletion",
-                  { organizationId, error },
+                  { organizationId },
                 ),
               ),
             );

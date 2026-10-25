@@ -1,14 +1,11 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
+import { requireInstanceMembership } from "./membership";
 import { Effect, Layer } from "effect";
 
-import {
-  IdentityProvider,
-  NoOrganization,
-  Unauthorized,
-  Unavailable,
-} from "@executor-js/api/server";
+import { IdentityProvider, Unauthorized } from "@executor-js/api/server";
 
+import { isPrivileged } from "../admin/require-admin";
 import { BetterAuth, type BetterAuthHandle } from "./better-auth";
-import { findInstanceMembership, type InstanceOrgRole } from "./membership";
 
 // ---------------------------------------------------------------------------
 // The self-host identity seam — the production implementation of the shared
@@ -34,23 +31,25 @@ const bearerToken = (headers: Headers): string | undefined => {
 };
 
 /**
- * Require the caller's CURRENT membership in the self-host instance
- * organization and resolve workspace-write authority from it. Ordinary
- * API/MCP requests and the browser-decision adapter use this exact lookup, so
- * removing a member denies their next request and a role change takes effect
- * at the next mutation decision, without trusting the global Better Auth user
- * role. A missing row fails NoOrganization. A failed read is unavailable.
+ * Resolve workspace-write authority from the caller's current membership in
+ * the self-host instance organization. Both ordinary API/MCP requests and the
+ * browser-decision adapter use this exact lookup so a role change takes effect
+ * at the mutation decision, without trusting the global Better Auth user role.
+ * Lookup failures fail closed to member authority.
  */
-export const requireInstanceMembership = (
+export const resolveSelfHostOrgRole = (
   betterAuth: BetterAuthHandle,
-  userId: string,
+  headers: Headers | Record<string, string>,
   organizationId: string,
-): Effect.Effect<InstanceOrgRole, NoOrganization | Unavailable> =>
-  findInstanceMembership(betterAuth, userId, organizationId).pipe(
-    Effect.mapError(() => new Unavailable({ message: "Membership lookup unavailable" })),
-    Effect.flatMap((membership) =>
-      membership ? Effect.succeed(membership.role) : Effect.fail(new NoOrganization()),
-    ),
+): Effect.Effect<"admin" | "member"> =>
+  Effect.tryPromise(() =>
+    betterAuth.auth.api.getActiveMemberRole({
+      headers,
+      query: { organizationId },
+    }),
+  ).pipe(
+    Effect.orElseSucceed(() => null),
+    Effect.map((membership) => (membership && isPrivileged(membership.role) ? "admin" : "member")),
   );
 
 // ---------------------------------------------------------------------------
@@ -65,7 +64,9 @@ export const requireInstanceMembership = (
 // Single-org instance, so organizationName is the boot-cached org name.
 // ---------------------------------------------------------------------------
 
-export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, BetterAuth> =
+export const makeBetterAuthIdentityLayer = (
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+): Layer.Layer<IdentityProvider, never, BetterAuth> =>
   Layer.effect(IdentityProvider)(
     Effect.gen(function* () {
       const betterAuth = yield* BetterAuth;
@@ -76,13 +77,18 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
             let resolved = yield* Effect.promise(() =>
               auth.api.getSession({ headers: request.headers }),
             );
+            // The credential shape that resolved the session — the SAME headers
+            // are what the membership-role lookup below must present.
+            let sessionHeaders: Headers | Record<string, string> = request.headers;
             if (!resolved) {
               const token = bearerToken(request.headers);
               if (token) {
+                const apiKeyHeaders = { "x-api-key": token };
                 resolved = yield* Effect.tryPromise({
-                  try: () => auth.api.getSession({ headers: { "x-api-key": token } }),
+                  try: () => auth.api.getSession({ headers: apiKeyHeaders }),
                   catch: () => "api-key session lookup failed",
                 }).pipe(Effect.orElseSucceed(() => null));
+                sessionHeaders = apiKeyHeaders;
               }
             }
             // No session resolved from any credential shape -> unauthenticated.
@@ -91,21 +97,16 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
             // Single-org instance: every authenticated user belongs to the one
             // seeded org. Cookie/bearer-session logins are pinned to it by the
             // session hook; API-key-minted sessions carry no active org, so we
-            // default to the seeded org. Whether the user STILL belongs to it
-            // is decided below, on every request.
+            // default to the seeded org rather than rejecting with NoOrganization.
             const resolvedOrganizationId = resolved.session.activeOrganizationId ?? organizationId;
-            // The credential names a user; the member row names a member. A
-            // user with no row in the INSTANCE org (removed, or never added) is
-            // refused with NoOrganization (403) — a removed member loses API
-            // and MCP access on their next request, whichever credential they
-            // hold. The workspace role comes from the same row, resolved
-            // against the instance org exactly as the admin gate does
-            // (require-admin.ts). Lookup failures return Unavailable for retry.
-            const orgRole = yield* requireInstanceMembership(
-              betterAuth,
-              resolved.user.id,
-              resolvedOrganizationId,
-            );
+            // The workspace role, resolved against the INSTANCE org exactly as
+            // the admin gate does (require-admin.ts): the explicit
+            // `organizationId` query keeps a caller-controlled active org from
+            // answering for an org they own elsewhere. FAIL CLOSED to "member"
+            // — an infra fault demotes rather than escalates.
+            const orgRole = yield* forkFeatures.has("current-membership")
+              ? requireInstanceMembership(betterAuth, resolved.user.id, resolvedOrganizationId)
+              : resolveSelfHostOrgRole(betterAuth, sessionHeaders, resolvedOrganizationId);
             return {
               kind: "member" as const,
               accountId: resolved.user.id,
@@ -126,3 +127,5 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
       });
     }),
   );
+
+export const betterAuthIdentityLayer = makeBetterAuthIdentityLayer();

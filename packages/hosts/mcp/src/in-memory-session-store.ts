@@ -1,3 +1,5 @@
+import { withStandaloneStreamKeepalive } from "./fork-standalone-stream";
+import type { ForkFeatures } from "@executor-js/sdk/core";
 import { Cause, Data, Effect, Layer } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -72,10 +74,10 @@ import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./too
 // answers; a POST carrying just the `notifications/initialized` notification
 // still gets a bare 202, which is exactly the cue the client SDK uses to open
 // the long-lived `GET /mcp` stream. So essentially every session holds an open
-// server-to-client stream for its whole life. After its opening comment, the
-// stream carries keepalive comments and server-initiated messages. This transport
-// does no max-age rotation, so it produces no recurring request to stamp against.
-// An open stream tells us the socket is up, never that the peer is still working.
+// server-to-client stream for its whole life. That stream is silent by design
+// (it exists for server-initiated messages) and this transport does no max-age
+// rotation, so it produces no recurring request to stamp against — an open
+// stream tells us the socket is up, never that the peer is still working.
 //
 // So the store treats a session as abandoned once it has gone `idleTtlMs`
 // without a REQUEST and disposes it, open stream or not. That mirrors cloud's
@@ -88,8 +90,6 @@ import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./too
 // loses its stream at the ceiling and re-initializes on its next call.
 /** Idle window after which an untouched session is evicted. */
 const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
-/** Comment cadence that keeps an idle event stream open through proxies. */
-const STREAM_KEEPALIVE_INTERVAL_MS = 25_000;
 /** Floor on the sweep interval, so a small TTL cannot spin the timer. */
 const MIN_SWEEP_INTERVAL_MS = 30 * 1000;
 
@@ -162,55 +162,6 @@ export interface InMemoryMcpSessionStore {
   /** Dispose every live session — wire into the host's shutdown (not a seam). */
   readonly close: () => Promise<void>;
 }
-
-const withStandaloneStreamKeepalive = (response: Response, signal: AbortSignal): Response => {
-  if (
-    response.status !== 200 ||
-    !response.headers.get("content-type")?.startsWith("text/event-stream") ||
-    !response.body
-  )
-    return response;
-  let pingTimer: ReturnType<typeof setInterval> | undefined;
-  const clearPing = (): void => {
-    if (pingTimer !== undefined) clearInterval(pingTimer);
-    signal.removeEventListener("abort", clearPing);
-  };
-  const encoder = new TextEncoder();
-  // Bun 1.3.11 skips TransformStream cancel on client disconnect, leaving the ping timer alive.
-  // A ReadableStream source cancel hook does run.
-  const reader = response.body.getReader();
-  const stream = new ReadableStream<Uint8Array>({
-    start: (controller) => {
-      // A first chunk lets HTTP servers flush the SSE headers before any event.
-      controller.enqueue(encoder.encode(": connected\n\n"));
-      if (signal.aborted) return;
-      signal.addEventListener("abort", clearPing);
-      pingTimer = setInterval(() => {
-        controller.enqueue(encoder.encode(": ping\n\n"));
-      }, STREAM_KEEPALIVE_INTERVAL_MS);
-    },
-    pull: (controller) =>
-      reader.read().then(
-        ({ done, value }) => {
-          if (done) {
-            clearPing();
-            controller.close();
-          } else {
-            controller.enqueue(value);
-          }
-        },
-        (error: unknown) => {
-          clearPing();
-          controller.error(error);
-        },
-      ),
-    cancel: (reason) => {
-      clearPing();
-      return reader.cancel(reason);
-    },
-  });
-  return new Response(stream, response);
-};
 
 const formatBoundaryError = (error: unknown): unknown =>
   // oxlint-disable-next-line executor/no-instanceof-error, executor/no-unknown-error-message -- boundary: log unknown MCP SDK/runtime failures
@@ -289,6 +240,7 @@ export const makeInMemoryMcpSessionStore = (
   // internal bind address (127.0.0.1:PORT), unreachable for the user. Omit it on
   // loopback hosts (local/desktop), where the request URL is already correct.
   options: {
+    readonly forkFeatures?: ForkFeatures;
     readonly webBaseUrl?: string;
     /** Idle window before a session is evicted. 0 disables eviction. */
     readonly sessionIdleTtlMs?: number;
@@ -302,7 +254,9 @@ export const makeInMemoryMcpSessionStore = (
   const engines = new Map<string, ExecutionEngine<Cause.YieldableError>>();
   const executors = new Map<string, Executor>();
   const closers = new Map<string, () => Promise<void>>();
-  const sessionAborts = new Map<string, AbortController>();
+  const sessionAborts = options.forkFeatures?.has("standalone-sse-keepalive")
+    ? new Map<string, AbortController>()
+    : undefined;
   const approvals: InProcessBrowserApprovalStore = makeInProcessBrowserApprovalStore();
   // Monotonic-ish last-touch stamp per live session, the first input the idle
   // sweep reads. Written on create and on every forwarded request.
@@ -373,8 +327,8 @@ export const makeInMemoryMcpSessionStore = (
     engines.delete(id);
     executors.delete(id);
     closers.delete(id);
-    sessionAborts.get(id)?.abort();
-    sessionAborts.delete(id);
+    sessionAborts?.get(id)?.abort();
+    sessionAborts?.delete(id);
     lastSeen.delete(id);
     activeRequests.delete(id);
     if (opts.transport)
@@ -446,8 +400,8 @@ export const makeInMemoryMcpSessionStore = (
   ): Effect.Effect<McpDispatchResult> => {
     const transport = transports.get(sessionId);
     const owner = owners.get(sessionId);
-    const sessionAbort = sessionAborts.get(sessionId);
-    if (!transport || !owner || !sessionAbort) return Effect.succeed("not-found");
+    const sessionAbort = sessionAborts?.get(sessionId);
+    if (!transport || !owner) return Effect.succeed("not-found");
     if (!sessionOwnerMatches(owner, principal, resource)) return Effect.succeed("forbidden");
     owners.set(sessionId, { principal, resource });
     touch(sessionId);
@@ -458,7 +412,7 @@ export const makeInMemoryMcpSessionStore = (
     beginRequest(sessionId);
     return runHandleRequest(transport, request, orgWriteAccessForPrincipal(principal)).pipe(
       Effect.map((response) =>
-        request.method === "GET"
+        request.method === "GET" && sessionAbort
           ? withStandaloneStreamKeepalive(response, sessionAbort.signal)
           : response,
       ),
@@ -529,7 +483,7 @@ export const makeInMemoryMcpSessionStore = (
               engines.set(sid, engine);
               if (executor) executors.set(sid, executor);
               if (close) closers.set(sid, close);
-              sessionAborts.set(sid, new AbortController());
+              sessionAborts?.set(sid, new AbortController());
               lastSeen.set(sid, Date.now());
             },
             onsessionclosed: (sid) => void dispose(sid, { server: true }),

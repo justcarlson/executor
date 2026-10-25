@@ -15,15 +15,7 @@ import {
 } from "@executor-js/sdk";
 
 import { readToolMode } from "./browser-approval";
-import {
-  COMPACT_ARGUMENT_LIMIT,
-  COMPACT_DESCRIPTION_LIMIT,
-  compactArguments,
-  compactDescription,
-  integrationAliasText,
-  passthroughCallCode,
-  resolveIntegrationAlias,
-} from "./passthrough-tools";
+import { passthroughCallCode } from "./passthrough-tools";
 import {
   createExecutorMcpServer,
   McpPassthroughUnavailableError,
@@ -206,122 +198,6 @@ describe("passthrough catalog", () => {
 // Wire flags
 // ---------------------------------------------------------------------------
 
-describe("integration aliases", () => {
-  const catalog = [
-    { slug: "google_gmail", name: "Gmail", description: "Send and read mail" },
-    { slug: "google_calendar", name: "Google Calendar", description: "Events and calendars" },
-    { slug: "directory-api", name: "Directory API", description: "Zones and records" },
-    { slug: "scrape_api", name: "ScrapeCreators", description: "Social media scraping" },
-    { slug: "catalog", name: "Catalog", description: "Media server" },
-  ];
-
-  it("resolves exact slugs, squashed names, word subsets, then descriptions", () => {
-    expect(resolveIntegrationAlias("catalog", catalog)).toEqual({ kind: "exact", slug: "catalog" });
-    expect(resolveIntegrationAlias("gmail", catalog)).toEqual({
-      kind: "alias",
-      slug: "google_gmail",
-    });
-    expect(resolveIntegrationAlias("Google Calendar", catalog)).toEqual({
-      kind: "alias",
-      slug: "google_calendar",
-    });
-    expect(resolveIntegrationAlias("googlegmail", catalog)).toEqual({
-      kind: "alias",
-      slug: "google_gmail",
-    });
-    expect(resolveIntegrationAlias("directory_api", catalog)).toEqual({
-      kind: "alias",
-      slug: "directory-api",
-    });
-    expect(resolveIntegrationAlias("scrapecreators", catalog)).toEqual({
-      kind: "alias",
-      slug: "scrape_api",
-    });
-    expect(resolveIntegrationAlias("mail", catalog)).toEqual({
-      kind: "alias",
-      slug: "google_gmail",
-    });
-    expect(resolveIntegrationAlias("google", catalog)).toEqual({
-      kind: "ambiguous",
-      slugs: ["google_calendar", "google_gmail"],
-    });
-    expect(resolveIntegrationAlias("notion", catalog)).toEqual({ kind: "none" });
-    expect(resolveIntegrationAlias("  ", catalog)).toEqual({ kind: "none" });
-  });
-
-  it("adds display-name words the slug lacks as ranking text", () => {
-    expect([...integrationAliasText(catalog)]).toEqual([
-      ["google_calendar", "googlecalendar"],
-      ["directory-api", "directoryapi"],
-      ["scrape_api", "creators scrapecreators"],
-    ]);
-  });
-});
-
-describe("compact search hits", () => {
-  it("keeps the first sentence of a description within the limit", () => {
-    expect(compactDescription(undefined)).toBe("");
-    expect(compactDescription("  \nList DNS records. Supports paging.\nMore.")).toBe(
-      "List DNS records.",
-    );
-    expect(compactDescription("No. Period means something else here, keep going")).toBe(
-      "No. Period means something else here, keep going",
-    );
-    const long = `Create ${"x".repeat(400)} end`;
-    const compact = compactDescription(long);
-    expect(compact.length).toBe(COMPACT_DESCRIPTION_LIMIT);
-    expect(compact.endsWith("…")).toBe(true);
-  });
-
-  it("summarizes arguments with types, required first, enums, arrays, refs and a cap", () => {
-    expect(compactArguments(undefined)).toBe("none");
-    expect(compactArguments({ type: "object" })).toBe("none");
-    expect(compactArguments({ oneOf: [{ type: "string" }, { type: "object" }] })).toBe(
-      "see full schema",
-    );
-    expect(
-      compactArguments(
-        {
-          type: "object",
-          properties: {
-            optional: { type: ["string", "null"] },
-            zone: { $ref: "#/$defs/Zone" },
-            kind: { enum: ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV"] },
-            tags: { type: "array", items: { $ref: "#/$defs/Tag" } },
-            either: { anyOf: [{ type: "string" }, { type: "number" }] },
-            nested: { properties: { a: { type: "string" } } },
-            body: {
-              type: "object",
-              properties: { text: { type: "string" }, title: { type: "string" } },
-              required: ["text"],
-            },
-            fixed: { const: 7 },
-          },
-          required: ["zone", "kind"],
-        },
-        { Zone: { type: "string" }, Tag: { type: "object", properties: {} } },
-      ),
-    ).toBe(
-      "zone (string, required); kind (A|AAAA|CNAME|MX|TXT|NS|…, required); optional (string); tags (object[]); either (string|number); nested (object{a}); body (object{text*, title}); fixed (7)",
-    );
-    const wideBody = Object.fromEntries(
-      Array.from({ length: 9 }, (_, i) => [`k${i}`, { type: "string" }]),
-    );
-    expect(
-      compactArguments({
-        type: "object",
-        properties: { body: { type: "object", properties: wideBody } },
-      }),
-    ).toBe("body (object{k0, k1, k2, k3, k4, k5, +3})");
-    const wide = Object.fromEntries(
-      Array.from({ length: COMPACT_ARGUMENT_LIMIT + 3 }, (_, i) => [`p${i}`, { type: "string" }]),
-    );
-    const summary = compactArguments({ type: "object", properties: wide });
-    expect(summary.split("; ")).toHaveLength(COMPACT_ARGUMENT_LIMIT + 1);
-    expect(summary.endsWith("; +3 more")).toBe(true);
-  });
-});
-
 describe("readToolMode", () => {
   const request = (query: string) => new Request(`https://example.test/mcp${query}`);
 
@@ -461,40 +337,6 @@ describe("passthrough mode server", () => {
     );
   });
 
-  it("reads the execute description only when a guide asks for it", async () => {
-    const { engine } = makeRecordingEngine();
-    let reads = 0;
-    const counting: ExecutionEngine = {
-      ...engine,
-      getDescription: Effect.sync(() => {
-        reads += 1;
-        return "test executor\n\n## Available integrations\n- github: issues";
-      }),
-    };
-    await withClient(
-      { engine: counting, mode: "passthrough", tools: toolPort(CATALOG) },
-      async (client) => {
-        // Session setup, the tool list, and a search never touch the inventory.
-        expect(reads).toBe(0);
-        await client.listTools();
-        await client.callTool({ name: "search", arguments: { query: "issues" } });
-        expect(reads).toBe(0);
-        // The guides read it once per session, then reuse it.
-        await client.callTool({ name: "skills", arguments: { name: "search-invoke" } });
-        await client.callTool({ name: "skills", arguments: {} });
-        expect(reads).toBe(1);
-      },
-    );
-    // Codemode registers the `execute` tool with the description, so it is read at build.
-    reads = 0;
-    await withClient({ engine: counting }, async (client) => {
-      expect(reads).toBe(1);
-      const guide = await client.callTool({ name: "skills", arguments: { name: "execute" } });
-      expect(JSON.stringify(guide.content)).toContain("## Available integrations");
-      expect(reads).toBe(1);
-    });
-  });
-
   it("serves only the search/invoke guide as text", async () => {
     const { engine } = makeRecordingEngine();
     await withClient({ engine, mode: "passthrough", tools: toolPort(CATALOG) }, async (client) => {
@@ -550,18 +392,7 @@ describe("passthrough mode server", () => {
       }),
     ];
     await withClient(
-      {
-        engine,
-        mode: "passthrough",
-        tools: toolPort(catalog, schemaReads),
-        integrations: {
-          list: () =>
-            Effect.succeed([
-              { slug: IntegrationSlug.make("github"), name: "GitHub", description: "" },
-              { slug: IntegrationSlug.make("github_other"), name: "Other", description: "" },
-            ]),
-        },
-      },
+      { engine, mode: "passthrough", tools: toolPort(catalog, schemaReads) },
       async (client) => {
         const args = {
           query: "issues",
@@ -597,130 +428,6 @@ describe("passthrough mode server", () => {
     );
   });
 
-  it("accepts integration aliases in search and integrations, and ranks by display name", async () => {
-    const { engine } = makeRecordingEngine();
-    const lists: string[] = [];
-    const catalog = [
-      projection({ integration: "google_gmail", name: "users.messages.send" }),
-      projection({ integration: "google_gmail", name: "users.messages.list" }),
-      projection({ integration: "google_calendar", name: "events.list" }),
-      projection({
-        integration: "scrape_api",
-        name: "profiles.get",
-        description: "Fetch a profile",
-      }),
-    ];
-    const account = (integration: string) => ({
-      integration,
-      owner: "org" as const,
-      name: "main",
-      identityLabel: null,
-      description: null,
-      lastHealth: null,
-    });
-    await withClient(
-      {
-        engine,
-        mode: "passthrough",
-        tools: toolPort(catalog, [], lists),
-        connections: {
-          list: () =>
-            Effect.succeed([
-              account("google_gmail"),
-              account("google_calendar"),
-              account("scrape_api"),
-            ]),
-        },
-        integrations: {
-          list: () =>
-            Effect.succeed([
-              { slug: IntegrationSlug.make("google_gmail"), name: "Gmail", description: "Mail" },
-              {
-                slug: IntegrationSlug.make("google_calendar"),
-                name: "Google Calendar",
-                description: "Events",
-              },
-              {
-                slug: IntegrationSlug.make("scrape_api"),
-                name: "ScrapeCreators",
-                description: "Scraping",
-              },
-            ]),
-        },
-      },
-      async (client) => {
-        // An alias narrows the list read to the resolved slug and reports it.
-        const alias = await client.callTool({
-          name: "search",
-          arguments: { query: "send", integration: "gmail", limit: 3 },
-        });
-        expect(alias.structuredContent).toMatchObject({
-          integration: "google_gmail",
-          total: 1,
-          items: [{ id: "tools.google_gmail.org.main.users.messages.send" }],
-        });
-        // An ambiguous alias searches every candidate and lists them.
-        const ambiguous = await client.callTool({
-          name: "search",
-          arguments: { query: "list", integration: "google" },
-        });
-        expect(ambiguous.structuredContent).toMatchObject({
-          integrations: ["google_calendar", "google_gmail"],
-          total: 2,
-        });
-        expect(
-          decodeSearchItems(ambiguous.structuredContent)
-            .items.map((item) => item.id)
-            .sort(),
-        ).toEqual([
-          "tools.google_calendar.org.main.events.list",
-          "tools.google_gmail.org.main.users.messages.list",
-        ]);
-        // An unknown value stays an exact filter (no hits) and explains itself.
-        const unknown = await client.callTool({
-          name: "search",
-          arguments: { query: "send", integration: "notion" },
-        });
-        expect(unknown.structuredContent).toMatchObject({
-          items: [],
-          total: 0,
-          hint: expect.stringContaining('No integration matches "notion"'),
-        });
-        // Query words naming an integration by display name rank its tools.
-        const byName = await client.callTool({
-          name: "search",
-          arguments: { query: "scrapecreators profile", limit: 3 },
-        });
-        expect(decodeSearchItems(byName.structuredContent).items.map((item) => item.id)).toEqual([
-          "tools.scrape_api.org.main.profiles.get",
-        ]);
-        // integrations accepts the same aliases.
-        const accounts = await client.callTool({
-          name: "integrations",
-          arguments: { integration: "gmail" },
-        });
-        expect(accounts.structuredContent).toMatchObject({
-          integration: "google_gmail",
-          total: 1,
-          items: [{ integration: "google_gmail" }],
-        });
-        const both = await client.callTool({
-          name: "integrations",
-          arguments: { integration: "google" },
-        });
-        expect(both.structuredContent).toMatchObject({
-          integrations: ["google_calendar", "google_gmail"],
-          total: 2,
-        });
-        const none = await client.callTool({
-          name: "integrations",
-          arguments: { integration: "notion" },
-        });
-        expect(none.structuredContent).toMatchObject({ total: 0, hint: expect.any(String) });
-      },
-    );
-  });
-
   it("serves four discovery and call tools even for 10000 tools", async () => {
     const { engine, executed } = makeRecordingEngine();
     const schemaReads: string[] = [];
@@ -747,18 +454,7 @@ describe("passthrough mode server", () => {
           "search",
           "skills",
         ]);
-        // Every byte here is paid on every turn of every client; the long
-        // guide stays behind `skills`.
-        expect(JSON.stringify(listed).length).toBeLessThan(3600);
-        const instructions = client.getInstructions() ?? "";
-        expect(instructions.length).toBeLessThan(1000);
-        // The instructions name the three-call path in order, with an example.
-        const order = ["integrations({})", "search({", "invoke({", "Example:"].map((marker) =>
-          instructions.indexOf(marker),
-        );
-        expect(order.every((index) => index >= 0)).toBe(true);
-        expect(order[0]).toBeLessThan(order[1]!);
-        expect(order[1]).toBeLessThan(order[2]!);
+        expect(JSON.stringify(listed).length).toBeLessThan(4000);
         expect(lists).toEqual([]);
         expect(schemaReads).toEqual([]);
         const result = await client.callTool({
@@ -843,75 +539,15 @@ describe("passthrough mode server", () => {
         arguments: { tool: String(dynamic.address), arguments: {} },
       });
       expect(invalid.isError).toBe(true);
-      // The validation error carries the current schema so the model can
-      // correct the call without another search.
-      const [invalidText] = invalid.content as ReadonlyArray<{ text: string }>;
-      expect(invalidText?.text).toContain("Invalid arguments");
-      expect(invalidText?.text).toContain('"required":["title"]');
       expect(recording.executed).toEqual([]);
       const refreshed = await client.callTool({ name: "search", arguments: { query: "notes" } });
       expect(refreshed.structuredContent).toMatchObject({
-        items: [{ arguments: "title (string, required)" }],
-      });
-      const full = await client.callTool({
-        name: "search",
-        arguments: { query: "notes", detail: "full" },
-      });
-      expect(full.structuredContent).toMatchObject({
         items: [{ inputSchema: { required: ["title"] } }],
       });
     });
   });
 
-  it("returns compact hits by default: identity, one-line description, argument summary", async () => {
-    const { engine } = makeRecordingEngine();
-    const catalog = [
-      projection({
-        integration: "github",
-        name: "issues.create",
-        description:
-          "Create an issue in a repository. Requires write access.\n\nLong second paragraph with details the model does not need to pick a tool.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            title: { type: "string" },
-            body: { $ref: "#/$defs/Body" },
-            labels: { type: "array", items: { type: "string" } },
-            state: { type: "string", enum: ["open", "closed"] },
-          },
-          required: ["title"],
-          $defs: { Body: { type: "string" } },
-        },
-      }),
-    ];
-    await withClient({ engine, mode: "passthrough", tools: toolPort(catalog) }, async (client) => {
-      const result = await client.callTool({
-        name: "search",
-        arguments: { query: "github issues create", limit: 1 },
-      });
-      expect(result.structuredContent).toEqual({
-        items: [
-          {
-            id: "tools.github.org.main.issues.create",
-            name: "issues.create",
-            integration: "github",
-            owner: "org",
-            connection: "main",
-            description: "Create an issue in a repository.",
-            arguments:
-              "title (string, required); body (string); labels (string[]); state (open|closed)",
-          },
-        ],
-        total: 1,
-        hasMore: false,
-        nextOffset: null,
-      });
-      expect(JSON.stringify(result.structuredContent)).not.toContain("inputSchema");
-      expect(JSON.stringify(result.structuredContent)).not.toContain("second paragraph");
-    });
-  });
-
-  it("returns full schemas and account details on request and marks invoke destructive", async () => {
+  it("returns schemas and account details from search and marks invoke destructive", async () => {
     const { engine } = makeRecordingEngine();
     await withClient({ engine, mode: "passthrough", tools: toolPort(CATALOG) }, async (client) => {
       const listed = await client.listTools();
@@ -925,7 +561,7 @@ describe("passthrough mode server", () => {
       });
       const result = await client.callTool({
         name: "search",
-        arguments: { query: "github issues create", limit: 1, detail: "full" },
+        arguments: { query: "github issues create", limit: 1 },
       });
       expect(result.structuredContent).toMatchObject({
         items: [

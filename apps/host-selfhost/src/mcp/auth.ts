@@ -1,3 +1,5 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
+import { findInstanceMembership, type MembershipLookupFailed } from "../auth/membership";
 import { Effect, Layer } from "effect";
 import { oAuthDiscoveryMetadata, oAuthProtectedResourceMetadata } from "better-auth/plugins";
 
@@ -12,8 +14,8 @@ import {
   type Principal,
 } from "@executor-js/host-mcp";
 
+import { isPrivileged } from "../admin/require-admin";
 import { BetterAuth } from "../auth/better-auth";
-import { findInstanceMembership, type MembershipLookupFailed } from "../auth/membership";
 import { MCP_ORIGINAL_PATH_HEADER, mcpResourcePathFromOriginalPath } from "./org-path";
 
 // ---------------------------------------------------------------------------
@@ -47,9 +49,9 @@ import { MCP_ORIGINAL_PATH_HEADER, mcpResourcePathFromOriginalPath } from "./org
 //          accepting it, then enrich the bare {userId} into a full principal.
 //       b. The existing IdentityProvider path (session cookie / bearer-session /
 //          x-api-key) — preserves API-key Bearer access for the API + MCP.
-//     Invalid credentials or absent membership yield `Unauthorized`; the
-//     envelope renders the 401 + challenge. A membership lookup failure yields
-//     `Unavailable` so clients can retry without authenticating again.
+//     Anything that fails or yields nothing collapses to `Unauthorized`; the
+//     envelope renders the 401 + challenge. Self-host always has an org, so it
+//     never returns Forbidden/Unavailable.
 //
 // The OAuth endpoints themselves (/api/auth/mcp/{register,authorize,token})
 // stay on the Better Auth handler mounted at /api/auth — NOT in this seam.
@@ -154,7 +156,9 @@ const toolkitProtectedResourceMetadata = (
   });
 };
 
-export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | IdentityProvider> =
+export const makeSelfHostMcpAuth = (
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+): Layer.Layer<McpAuthProvider, never, BetterAuth | IdentityProvider> =>
   Layer.effect(
     McpAuthProvider,
     Effect.gen(function* () {
@@ -203,11 +207,7 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
       // Resolved once; `internalAdapter.findUserById` enriches an OAuth userId.
       const context = yield* Effect.promise(() => auth.$context);
 
-      /** Enrich a bare OAuth `userId` into the full provider-neutral principal.
-       * `null` when the user is gone OR is no longer a member of the instance
-       * org: an OAuth token outlives a removed membership, so the member row
-       * is read on every request (../auth/membership.ts) and its absence
-       * refuses the token — the caller renders the 401 challenge. */
+      /** Enrich a bare OAuth `userId` into the full provider-neutral principal. */
       const principalFromUserId = (
         userId: string,
       ): Effect.Effect<Principal | null, MembershipLookupFailed> =>
@@ -217,10 +217,24 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
           // The workspace role, read from the INSTANCE org's membership row
           // (an OAuth token carries no session, so the header-based
           // `getActiveMemberRole` gate is out of reach — the adapter query
-          // answers the same question against the same table). A missing row
-          // refuses the token. A failed read remains a transient error.
-          const membership = yield* findInstanceMembership(betterAuth, userId, organizationId);
-          if (!membership) return null;
+          // answers the same question against the same table). FAIL CLOSED to
+          // "member": an infra fault demotes rather than escalates.
+          const membership = yield* forkFeatures.has("current-membership")
+            ? findInstanceMembership(betterAuth, userId, organizationId)
+            : Effect.promise(() =>
+                context.adapter.findOne<{ readonly role?: string | null }>({
+                  model: "member",
+                  where: [
+                    { field: "userId", value: userId },
+                    { field: "organizationId", value: organizationId },
+                  ],
+                }),
+              ).pipe(Effect.orElseSucceed(() => null));
+          if (forkFeatures.has("current-membership") && !membership) return null;
+          const orgRole =
+            membership?.role != null && isPrivileged(membership.role)
+              ? ("admin" as const)
+              : ("member" as const);
           return {
             accountId: user.id,
             // Single-org self-host: OAuth tokens carry no active org, so pin to
@@ -233,15 +247,15 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
             avatarUrl: user.image ?? null,
             roles: parseRoles(userRole(user)),
             orgRoleModel: "organization",
-            orgRole: membership.role,
+            orgRole,
           } satisfies Principal;
         });
 
       /** (a) The mcp() OAuth opaque bearer, with self-enforced expiry. */
       const authenticateOAuthBearer = (
         request: Request,
-      ): Effect.Effect<Principal | null, MembershipLookupFailed> =>
-        Effect.gen(function* () {
+      ): Effect.Effect<Principal | null, MembershipLookupFailed> => {
+        const authentication = Effect.gen(function* () {
           const session = yield* Effect.promise(() =>
             auth.api.getMcpSession({ headers: request.headers }),
           );
@@ -251,6 +265,10 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
           if (new Date(session.accessTokenExpiresAt).getTime() < Date.now()) return null;
           return yield* principalFromUserId(session.userId);
         });
+        return forkFeatures.has("current-membership")
+          ? authentication
+          : authentication.pipe(Effect.orElseSucceed(() => null));
+      };
 
       /** (b) The existing cookie / bearer-session / x-api-key path. The fallback's
        * api `Principal` shape is byte-identical to host-mcp's `Principal`. The
@@ -270,7 +288,8 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
       /**
        * Try the OAuth bearer ONLY when a Bearer header is present (no
        * getMcpSession round-trip on cookie requests), then the cookie/api-key
-       * fallback.
+       * fallback. Self-host always pins an org, so the outcome is always
+       * Authenticated or Unauthorized.
        */
       const authenticate = (request: Request): Effect.Effect<AuthOutcome> =>
         (hasBearer(request)
@@ -298,3 +317,5 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
       };
     }),
   );
+
+export const selfHostMcpAuth = makeSelfHostMcpAuth();

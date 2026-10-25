@@ -1,25 +1,8 @@
+import { NoOrganization, Unavailable } from "@executor-js/api/server";
 import { Data, Effect } from "effect";
 
 import { isPrivileged } from "../admin/require-admin";
 import type { BetterAuthHandle } from "./better-auth";
-
-// ---------------------------------------------------------------------------
-// The one membership read every authenticated self-host request makes.
-//
-// A credential (session cookie, bearer session token, API key, mcp() OAuth
-// access token) proves WHO the caller is. It does not prove the caller still
-// belongs to the instance organization: removing a member deletes the `member`
-// row and nothing else, so every session, key and token the removed user holds
-// keeps resolving to a user. Membership is therefore read from the row on
-// every request, after the credential resolves, and a missing row denies the
-// request. There is no cache: a removed member is refused on the very next
-// request, and re-adding them restores access on the next request too.
-//
-// This is the same `(userId, organizationId)` row the organization plugin's
-// `getActiveMemberRole` endpoint answers from, read through Better Auth's own
-// adapter so the OAuth seam (which holds no session headers) can share it. One
-// direct read per request, shared by the API, MCP, account and approval planes.
-// ---------------------------------------------------------------------------
 
 export type InstanceOrgRole = "admin" | "member";
 
@@ -56,4 +39,16 @@ export const findInstanceMembership = (
       row ? { role: row.role != null && isPrivileged(row.role) ? "admin" : "member" } : null,
     ),
     Effect.withSpan("selfhost.identity.membership"),
+  );
+
+export const requireInstanceMembership = (
+  betterAuth: BetterAuthHandle,
+  userId: string,
+  organizationId: string,
+): Effect.Effect<InstanceOrgRole, NoOrganization | Unavailable> =>
+  findInstanceMembership(betterAuth, userId, organizationId).pipe(
+    Effect.mapError(() => new Unavailable({ message: "Membership lookup unavailable" })),
+    Effect.flatMap((membership) =>
+      membership ? Effect.succeed(membership.role) : Effect.fail(new NoOrganization()),
+    ),
   );

@@ -1,8 +1,7 @@
-import { HttpApiBuilder } from "effect/unstable/httpapi";
 import { HttpServerRequest } from "effect/unstable/http";
 import { Effect } from "effect";
 
-import { AccountHttpApi } from "./api";
+import type { AccountGroupHandlers } from "./fork-account-api";
 import { AccountProvider, type AccountHeaders } from "./service";
 
 // ---------------------------------------------------------------------------
@@ -18,7 +17,7 @@ const requestHeaders = Effect.map(
   (req): AccountHeaders => ({ ...req.headers }),
 );
 
-export const AccountHandlers = HttpApiBuilder.group(AccountHttpApi, "account", (handlers) =>
+export const accountHandlers = (handlers: AccountGroupHandlers) =>
   handlers
     .handle("me", () =>
       Effect.gen(function* () {
@@ -101,5 +100,4 @@ export const AccountHandlers = HttpApiBuilder.group(AccountHttpApi, "account", (
         const headers = yield* requestHeaders;
         return yield* (yield* AccountProvider).updateOrgName(headers, payload.name);
       }),
-    ),
-);
+    );

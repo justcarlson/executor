@@ -1,3 +1,5 @@
+import { forkFeaturesOff, type ForkFeatures } from "./fork-features";
+import { prepareToolPolicies } from "./fork-prepared-policies";
 import {
   Cause,
   Deferred,
@@ -34,6 +36,7 @@ import {
 import { makeFumaBlobStore, pluginBlobStore, type BlobStore, type OwnerPartitions } from "./blob";
 import { makePendingApprovalStore, type PendingApprovalStore } from "./pending-approval";
 import { coreToolsPlugin } from "./core-tools";
+import { catalogRowsMatch } from "./fork-catalog-rows";
 import type {
   Connection,
   ConnectionInputOrigin,
@@ -158,10 +161,8 @@ import {
   isValidPattern,
   matchPattern,
   positionForNewPattern,
-  prepareToolPolicies,
   resolveEffectivePolicy,
   rowToToolPolicy,
-  type PreparedToolPolicies,
   type CreateToolPolicyInput,
   type EffectivePolicy,
   type RemoveToolPolicyInput,
@@ -214,6 +215,7 @@ import {
   isUnusableSuccessTokenResponse,
   optionalScopesFromAuthorizationUrl,
   shouldRefreshToken,
+  tokenEndpointForRefresh,
   type OAuth2TokenResponse,
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
@@ -706,6 +708,7 @@ export type ExecutorDbFactory = (config: {
 }) => ExecutorDbInput | Effect.Effect<ExecutorDbInput, StorageFailure>;
 
 export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly []> {
+  readonly forkFeatures?: ForkFeatures;
   /** The org / workspace this executor is bound to. `owner: "org"` rows file
    *  here. */
   readonly tenant: Tenant;
@@ -860,15 +863,14 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
   readonly orgWrites?: OrgWriteAccess | "request";
 }
 
-/** Options for `executor.tools.schema`. */
 export interface ToolSchemaOptions {
-  /** Build the TypeScript preview fields (default `true`). */
   readonly typeScript?: boolean;
 }
 
 /** Default freshness window for remote-catalog connections (see
  *  `ExecutorConfig.toolsSyncTtlMs`). */
 export const DEFAULT_TOOLS_SYNC_TTL_MS = 15 * 60 * 1000;
+export const CATALOG_READER_WAIT_MS = 1000;
 
 /** Default wait budget a tools read spends on stale-catalog rebuilds before
  *  answering from the persisted rows (see `ExecutorConfig.toolsSyncGraceMs`).
@@ -876,7 +878,6 @@ export const DEFAULT_TOOLS_SYNC_TTL_MS = 15 * 60 * 1000;
  *  `tools/list`) while keeping a read gated on a slow or dead server bounded
  *  well under any per-connection network timeout. */
 export const DEFAULT_TOOLS_SYNC_GRACE_MS = 2000;
-export const CATALOG_READER_WAIT_MS = 1000;
 
 /** How many stale connection catalogs are DISCOVERED at once on a tools read.
  *  Bounded so a host with a large stale set cannot open an unbounded number of
@@ -922,23 +923,6 @@ const storageFailureFromUnknown = (message: string, cause: unknown): StorageFail
 
 const pluginStorageFailure = (pluginId: string, hook: string, cause: unknown): StorageFailure =>
   storageFailureFromUnknown(`${hook} failed for plugin ${pluginId}`, cause);
-
-// oxlint-disable executor/no-instanceof-error, executor/no-unknown-error-message -- boundary: render an arbitrary failure into one readable log field
-/** One-line rendering of a failed rebuild, for the operator-facing warning.
- *  A `StorageError` carries the actionable detail in its `cause` (the plugin's
- *  own failure) while its own message only names the hook, and structural
- *  stringification drops a `cause` that is an `Error` — so unwrap one level and
- *  keep both halves. */
-const describeSyncFailure = (error: unknown): string => {
-  const base =
-    error instanceof Error && error.message.length > 0
-      ? error.message
-      : Inspectable.toStringUnknown(error, 0);
-  const cause = (error as { readonly cause?: unknown } | null | undefined)?.cause;
-  if (cause instanceof Error && cause.message.length > 0) return `${base}: ${cause.message}`;
-  return base;
-};
-// oxlint-enable executor/no-instanceof-error, executor/no-unknown-error-message
 
 const createDefaultMemoryDb = (tables: FumaTables): ExecutorDb => {
   const version = "1.0.0";
@@ -1240,24 +1224,6 @@ const rowToTool = (
     outputSchema: decodeJsonColumn(row.output_schema),
     annotations: annotations ?? (decodeJsonColumn(row.annotations) as ToolAnnotations | undefined),
   };
-};
-
-// Database row order is unspecified. Names are unique within a connection.
-const catalogRowsMatch = <Row extends { readonly name: string }>(
-  stored: readonly Row[],
-  proposed: readonly Row[],
-  columns: readonly (keyof Row)[],
-): boolean => {
-  if (stored.length !== proposed.length) return false;
-  const byName = new Map(proposed.map((row) => [row.name, row]));
-  return stored.every((row) => {
-    const candidate = byName.get(row.name);
-    return (
-      candidate !== undefined &&
-      JSON.stringify(columns.map((column) => row[column])) ===
-        JSON.stringify(columns.map((column) => candidate[column]))
-    );
-  });
 };
 
 // Projects a tool's annotations onto the schema view. Plugins persist extra
@@ -1942,6 +1908,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
   config: ExecutorConfig<TPlugins>,
 ): Effect.Effect<Executor<TPlugins>, StorageFailure> =>
   Effect.gen(function* () {
+    const forkFeatures = config.forkFeatures ?? forkFeaturesOff;
     const defaultPlugins = (): TPlugins => {
       const empty: readonly AnyPlugin[] = [];
       return empty as TPlugins;
@@ -2741,7 +2708,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // Refresh against the region the code was redeemed at when one was
         // recorded at connect time (multi-site providers like Datadog), else
         // the oauth_client's configured token endpoint.
-        const tokenUrl = row.oauth_token_url ? String(row.oauth_token_url) : clientRow.tokenUrl;
+        const tokenUrl = tokenEndpointForRefresh(
+          clientRow.tokenUrl,
+          row.oauth_token_url == null ? null : String(row.oauth_token_url),
+        );
+        if (tokenUrl === undefined) {
+          return yield* reauth("Stored OAuth token endpoint is no longer trusted; reconnect.");
+        }
 
         // Enterprise-managed authorization (the ID-JAG grant profile) issues NO
         // refresh token by design — the identity assertion in `refresh_item_id`
@@ -3544,8 +3517,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // failure #1563 fixed for concurrent refreshes of the SAME connection via
     // the single-flight map below. Rebuilding several DIFFERENT connections
     // together (the stale-catalog fan-out) reopens the same hazard from the
-    // other side, so the write phase takes a single permit even when urgent
-    // discoveries overlap or bypass the detached discovery queue.
+    // other side, so the write phase takes a single permit: the fan-out's
+    // discoveries still run together and their commits form a queue.
     //
     // Never take this permit while a transaction is already open on this fiber
     // — every caller of `persistCatalog` must be outside one, as all of the
@@ -3597,10 +3570,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       integrationRow: IntegrationRow,
       ref: ConnectionRef,
       mode: () => ToolProductionMode,
-      foreground: Deferred.Deferred<void>,
+      foreground?: Deferred.Deferred<void>,
     ): Effect.Effect<readonly Tool[], IntegrationNotFoundError | StorageFailure> =>
       Effect.gen(function* () {
-        yield* yieldBackgroundCatalog(mode, foreground);
+        if (config.forkFeatures?.has("detached-catalog-refresh") && foreground) {
+          yield* yieldBackgroundCatalog(mode, foreground);
+        }
         const runtime = runtimes.get(integrationRow.plugin_id);
         const keys = yield* Effect.try({
           try: () => ownedKeys(ref.owner),
@@ -3629,19 +3604,25 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               }
             : { tools_synced_at: Date.now() };
         };
-        // Every successful exit stamps the sync time, including cleanup paths,
-        // so the next read does not repeat discovery after another row write.
-        // Read health inside persistence so discovery and reader parks cannot
-        // hide a newer verdict. No timestamp comparison can skip the stamp.
-        const stampSynced = () =>
-          findConnectionRow(ref).pipe(
-            Effect.flatMap((fresh) =>
-              core.updateMany("connection", {
+        // Every exit stamps the sync time — including the cleanup paths that
+        // produce zero tools — so the stale-catalog check (`config_revised_at`
+        // vs `tools_synced_at`) doesn't re-attempt this connection per read.
+        // Successful syncs also clear stale sync-failure health records, while
+        // preserving genuine health-check outcomes.
+        const stampSynced = (row: ConnectionRow | null) =>
+          config.forkFeatures?.has("detached-catalog-refresh")
+            ? findConnectionRow(ref).pipe(
+                Effect.flatMap((fresh) =>
+                  core.updateMany("connection", {
+                    where: connectionWhere,
+                    set: syncedSet(fresh),
+                  }),
+                ),
+              )
+            : core.updateMany("connection", {
                 where: connectionWhere,
-                set: syncedSet(fresh),
-              }),
-            ),
-          );
+                set: syncedSet(row),
+              });
         // A failing sync must not bury a recorded dead grant's `expired`
         // verdict: this sync's own credential resolution is what discovers
         // invalid_grant (refresh → recorder), so by failure time the row
@@ -3719,7 +3700,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             Effect.gen(function* () {
               yield* core.deleteMany("tool", { where });
               yield* core.deleteMany("definition", { where });
-              yield* stampSynced();
+              yield* stampSynced(existingRow);
             }),
           );
           return [];
@@ -3731,7 +3712,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             Effect.gen(function* () {
               yield* core.deleteMany("tool", { where });
               yield* core.deleteMany("definition", { where });
-              yield* stampSynced();
+              yield* stampSynced(existingRow);
             }),
           );
           return [];
@@ -3755,7 +3736,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             ),
           );
 
-        yield* yieldBackgroundCatalog(mode, foreground);
+        if (config.forkFeatures?.has("detached-catalog-refresh") && foreground) {
+          yield* yieldBackgroundCatalog(mode, foreground);
+        }
         if (result.incomplete === true) {
           // Non-authoritative listing (integration unreachable, auth not ready).
           // Keep the existing catalog — replacing it would wipe working tools
@@ -3774,7 +3757,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }
 
         if (
-          mode() !== "explicit" &&
+          (config.forkFeatures?.has("detached-catalog-refresh")
+            ? mode() !== "explicit"
+            : mode() === "background") &&
           runtime.plugin.remoteToolCatalog === true &&
           result.tools.length === 0
         ) {
@@ -3822,38 +3807,42 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           created_at: now,
         }));
 
-        yield* yieldBackgroundCatalog(mode, foreground);
+        if (config.forkFeatures?.has("detached-catalog-refresh") && foreground) {
+          yield* yieldBackgroundCatalog(mode, foreground);
+        }
         yield* persistCatalog(
           Effect.gen(function* () {
-            const toolColumns = [
-              "plugin_id",
-              "name",
-              "description",
-              "input_schema",
-              "output_schema",
-              "annotations",
-            ] as const;
-            const definitionColumns = ["plugin_id", "name", "schema"] as const;
-            const storedTools = yield* core.findMany("tool", { where, select: toolColumns });
-            const storedDefinitions = yield* core.findMany("definition", {
-              where,
-              select: definitionColumns,
-            });
-            const unchanged = yield* Effect.try({
-              try: () =>
-                catalogRowsMatch(storedTools, toolRows, toolColumns) &&
-                catalogRowsMatch(storedDefinitions, definitionRows, definitionColumns),
-              catch: (cause) => storageFailureFromUnknown("comparing tool catalog", cause),
-            });
-            if (unchanged) {
-              yield* stampSynced();
-              return;
+            if (config.forkFeatures?.has("detached-catalog-refresh")) {
+              const toolColumns = [
+                "plugin_id",
+                "name",
+                "description",
+                "input_schema",
+                "output_schema",
+                "annotations",
+              ] as const;
+              const definitionColumns = ["plugin_id", "name", "schema"] as const;
+              const storedTools = yield* core.findMany("tool", { where, select: toolColumns });
+              const storedDefinitions = yield* core.findMany("definition", {
+                where,
+                select: definitionColumns,
+              });
+              const unchanged = yield* Effect.try({
+                try: () =>
+                  catalogRowsMatch(storedTools, toolRows, toolColumns) &&
+                  catalogRowsMatch(storedDefinitions, definitionRows, definitionColumns),
+                catch: (cause) => storageFailureFromUnknown("comparing tool catalog", cause),
+              });
+              if (unchanged) {
+                yield* stampSynced(existingRow);
+                return;
+              }
             }
             yield* core.deleteMany("tool", { where });
             yield* core.deleteMany("definition", { where });
             yield* core.createMany("tool", toolRows);
             yield* core.createMany("definition", definitionRows);
-            yield* stampSynced();
+            yield* stampSynced(existingRow);
           }),
         );
 
@@ -3882,7 +3871,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     type ToolProductionError = IntegrationNotFoundError | StorageFailure;
     interface ToolProductionInFlight {
       readonly deferred: Deferred.Deferred<readonly Tool[], ToolProductionError>;
-      readonly foreground: Deferred.Deferred<void>;
+      readonly foreground?: Deferred.Deferred<void>;
       mode: ToolProductionMode;
     }
     const toolProductionInFlight = new Map<string, ToolProductionInFlight>();
@@ -3896,17 +3885,22 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         const existing = toolProductionInFlight.get(key);
         if (existing) {
           if (requestedMode === "explicit") existing.mode = "explicit";
-          return requestedMode === "detached"
-            ? Effect.succeed([])
-            : Deferred.succeed(existing.foreground, undefined).pipe(
-                Effect.andThen(Deferred.await(existing.deferred)),
-              );
+          if (config.forkFeatures?.has("detached-catalog-refresh") && existing.foreground) {
+            return requestedMode === "detached"
+              ? Effect.succeed([])
+              : Deferred.succeed(existing.foreground, undefined).pipe(
+                  Effect.andThen(Deferred.await(existing.deferred)),
+                );
+          }
+          return Deferred.await(existing.deferred);
         }
 
         const entry: ToolProductionInFlight = {
           deferred: Deferred.makeUnsafe<readonly Tool[], ToolProductionError>(),
           mode: requestedMode,
-          foreground: Deferred.makeUnsafe<void>(),
+          foreground: config.forkFeatures?.has("detached-catalog-refresh")
+            ? Deferred.makeUnsafe<void>()
+            : undefined,
         };
         toolProductionInFlight.set(key, entry);
         const run = produceConnectionToolsUnshared(
@@ -4339,11 +4333,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                     rowDeleteAttempted
                       ? Effect.logError(
                           "executor connection create could not confirm its compensating row delete: the connection row may be deleted or stranded",
-                          { ...logContext, cause },
+                          { ...logContext, causeKind: Cause.isCause(cause) ? "Cause" : "Error" },
                         ).pipe(Effect.as("unknown" as const))
                       : Effect.logError(
                           "executor connection create stranded a connection row it could not delete",
-                          { ...logContext, cause },
+                          { ...logContext, causeKind: Cause.isCause(cause) ? "Cause" : "Error" },
                         ).pipe(Effect.as("failed" as const)),
                   ),
                 );
@@ -4409,7 +4403,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 if (Predicate.isTagged(restoreOutcome, "Failed")) {
                   yield* Effect.logError(
                     "executor connection create failed to restore credential writes",
-                    { ...logContext, cause: restoreOutcome.cause },
+                    { ...logContext, causeKind: "CredentialRestoreError" },
                   );
                 }
               });
@@ -4735,7 +4729,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                       owner: input.owner,
                       integration: String(input.integration),
                       connection: String(name),
-                      cause,
+                      causeKind: Cause.isCause(cause) ? "Cause" : "Error",
                     },
                   ).pipe(Effect.as(false)),
                 ),
@@ -4813,7 +4807,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                     Effect.logWarning("executor OAuth tool sync failed", {
                       integration: String(ref.integration),
                       connection: String(ref.name),
-                      error: describeSyncFailure(error),
+                      errorTag: Predicate.isTagged(error, "StorageError")
+                        ? "StorageError"
+                        : "Unknown",
                     }),
                   ),
                   Effect.withSpan("executor.oauth.tools.sync", {
@@ -5533,12 +5529,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // ------------------------------------------------------------------
 
     type ActivePolicyRuleSet =
-      | {
-          readonly kind: "global";
-          readonly rows: readonly ToolPolicyRow[];
-          /** Sorted and indexed once per snapshot; resolves each tool in O(matches). */
-          readonly prepared: PreparedToolPolicies;
-        }
+      | { readonly kind: "global"; readonly rows: readonly ToolPolicyRow[] }
       | {
           readonly kind: "provider";
           readonly provider: ToolPolicyProvider;
@@ -5559,13 +5550,13 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     };
 
-    // `sortedRules` must already be in `compareProviderPolicyRule` order; the
-    // rule set sorts once per snapshot instead of once per tool.
     const resolveProviderPolicyFromRules = (
       toolId: string,
-      sortedRules: readonly ToolPolicyProviderRule[],
+      rules: readonly ToolPolicyProviderRule[],
     ): EffectivePolicy => {
-      for (const rule of sortedRules) {
+      for (const rule of forkFeatures.has("catalog-read-fastpath")
+        ? rules
+        : [...rules].sort(compareProviderPolicyRule)) {
         if (!matchPattern(rule.pattern, toolId)) continue;
         return {
           action: rule.action,
@@ -5583,10 +5574,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       };
     };
 
-    // `forToolId` narrows the global rule read to rows that can match that one
-    // tool: an exact pattern (no `*` segment) matches only when it equals the
-    // tool id, so every other exact row is irrelevant to its resolution. The
-    // remaining rows keep their relative order, so the answer is unchanged.
     const listActivePolicyRuleSet = (
       forToolId?: string,
     ): Effect.Effect<ActivePolicyRuleSet, StorageFailure> =>
@@ -5612,29 +5599,36 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 Effect.map((rules) => ({
                   kind: "provider" as const,
                   provider: activeToolPolicyProvider!,
-                  rules: [...rules].sort(compareProviderPolicyRule),
+                  rules: forkFeatures.has("catalog-read-fastpath")
+                    ? [...rules].sort(compareProviderPolicyRule)
+                    : rules,
                 })),
               )
         : core
             .findMany(
               "tool_policy",
-              forToolId === undefined
-                ? {}
-                : {
+              forkFeatures.has("catalog-read-fastpath") && forToolId !== undefined
+                ? {
                     where: (b: AnyCb) =>
                       b.or(b("pattern", "=", forToolId), b("pattern", "contains", "*")),
-                  },
+                  }
+                : {},
             )
             .pipe(
-              Effect.map((rows) => ({
-                kind: "global" as const,
-                rows,
-                prepared: prepareToolPolicies(rows, ownerRankForRow),
-              })),
+              Effect.map((rows): ActivePolicyRuleSet => {
+                if (forkFeatures.has("catalog-read-fastpath")) {
+                  const prepared = prepareToolPolicies(rows, ownerRankForRow);
+                  return {
+                    kind: "prepared",
+                    dynamicScope: undefined,
+                    resolve: ({ toolId, defaultRequiresApproval }) =>
+                      prepared.resolveEffective(toolId, defaultRequiresApproval),
+                  };
+                }
+                return { kind: "global", rows };
+              }),
             );
 
-    // Synchronous resolution for rule sets that need no further I/O. Returns
-    // `undefined` only for a provider that resolves per tool.
     const resolvePolicyFromRuleSetSync = (
       toolId: string,
       ruleSet: ActivePolicyRuleSet,
@@ -5642,24 +5636,29 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     ): EffectivePolicy | undefined =>
       ruleSet.kind === "prepared"
         ? ruleSet.resolve({ toolId, defaultRequiresApproval })
-        : ruleSet.kind === "provider"
-          ? ruleSet.provider.resolve
-            ? undefined
-            : resolveProviderPolicyFromRules(toolId, ruleSet.rules ?? [])
-          : ruleSet.prepared.resolveEffective(toolId, defaultRequiresApproval);
+        : ruleSet.kind === "provider" && !ruleSet.provider.resolve
+          ? resolveProviderPolicyFromRules(toolId, ruleSet.rules ?? [])
+          : undefined;
 
     const resolvePolicyFromRuleSet = (
       toolId: string,
       ruleSet: ActivePolicyRuleSet,
       defaultRequiresApproval?: boolean,
-    ): Effect.Effect<EffectivePolicy, StorageFailure> => {
-      if (ruleSet.kind === "provider" && ruleSet.provider.resolve) {
-        return ruleSet.provider.resolve({ toolId, defaultRequiresApproval });
-      }
-      return Effect.succeed(
-        resolvePolicyFromRuleSetSync(toolId, ruleSet, defaultRequiresApproval)!,
-      );
-    };
+    ): Effect.Effect<EffectivePolicy, StorageFailure> =>
+      ruleSet.kind === "prepared"
+        ? Effect.succeed(ruleSet.resolve({ toolId, defaultRequiresApproval }))
+        : ruleSet.kind === "provider"
+          ? ruleSet.provider.resolve
+            ? ruleSet.provider.resolve({ toolId, defaultRequiresApproval })
+            : Effect.succeed(resolveProviderPolicyFromRules(toolId, ruleSet.rules ?? []))
+          : Effect.succeed(
+              resolveEffectivePolicy(
+                toolId,
+                ruleSet.rows,
+                ownerRankForRow,
+                defaultRequiresApproval,
+              ),
+            );
 
     // ------------------------------------------------------------------
     // Tools (read surface)
@@ -5713,7 +5712,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 Effect.logWarning("executor detached tool sync failed", {
                   integration: connection.integration,
                   connection: connection.name,
-                  error: describeSyncFailure(error),
+                  errorTag: Predicate.isTagged(error, "StorageError") ? "StorageError" : "Unknown",
                 }),
               ),
               Effect.ensuring(
@@ -5787,9 +5786,12 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               ? b.isNull("tools_synced_at")
               : b.or(b.isNull("tools_synced_at"), b("tools_synced_at", "<", staleBefore)),
         });
-        // Urgent rebuilds can overlap. Detached TTL discoveries use a serial
-        // queue to limit contention with reads. `persistCatalog` serializes
-        // writes from both paths on a one-connection database.
+        // Each rebuild is an independent upstream listing, so they run together
+        // rather than one after another: a host with many stale remote-catalog
+        // connections otherwise pays the sum of every server's latency on the
+        // read that trips the TTL. Only the listings overlap — `persistCatalog`
+        // keeps the catalog writes in a single-file queue, so this fan-out never
+        // opens two transactions on a one-connection database.
         //
         // Two urgency classes. A stale-MARKED or config-revised catalog is known
         // wrong (the upstream said so, or the integration's config changed), so
@@ -5799,7 +5801,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // persisted rows at once. Without that split every read after the TTL
         // paid the grace budget for MCP listings it had no reason to wait on.
         const urgent: Effect.Effect<readonly Tool[]>[] = [];
-        const deferred: Effect.Effect<void>[] = [];
+        const deferred: Effect.Effect<readonly Tool[] | void>[] = [];
         for (const connection of connections) {
           const integrationRow = integrationBySlug.get(connection.integration);
           if (!integrationRow) continue;
@@ -5826,46 +5828,79 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             syncedAt < cutoff;
           if (!staleMarked && !configRevised && !expired) continue;
 
-          const ref: ConnectionRef = {
-            owner: connection.owner as Owner,
-            integration: IntegrationSlug.make(connection.integration),
-            name: ConnectionName.make(connection.name),
-          };
-          const detached =
-            mode !== "converge" && ((!staleMarked && !configRevised) || toolsSyncGraceMs === 0);
-          const rebuild = produceConnectionTools(
-            integrationRow,
-            ref,
-            detached ? "detached" : "background",
-          ).pipe(
-            // Best-effort, but never silent: the read still succeeds on the
-            // stale-but-working catalog and the peer rebuilds still finish,
-            // while the operator gets the connection that failed and why.
-            // Without this a connection whose upstream is permanently broken
-            // re-fails on every read and leaves no trace anywhere.
-            Effect.catch((error) =>
-              Effect.logWarning("executor stale tool sync failed", {
-                integration: connection.integration,
-                connection: connection.name,
-                error: describeSyncFailure(error),
-              }).pipe(Effect.as([] as readonly Tool[])),
-            ),
-            Effect.withSpan("executor.tools.sync_stale", {
-              attributes: {
-                "executor.integration": connection.integration,
-                "executor.connection": connection.name,
-              },
-            }),
-          );
-          if (!detached) {
-            urgent.push(rebuild);
-          } else {
-            deferred.push(queueDetachedToolSync(connection, ref, rebuild));
+          if (config.forkFeatures?.has("detached-catalog-refresh")) {
+            const ref: ConnectionRef = {
+              owner: connection.owner as Owner,
+              integration: IntegrationSlug.make(connection.integration),
+              name: ConnectionName.make(connection.name),
+            };
+            const detached =
+              mode !== "converge" && ((!staleMarked && !configRevised) || toolsSyncGraceMs === 0);
+            const rebuild = produceConnectionTools(
+              integrationRow,
+              ref,
+              detached ? "detached" : "background",
+            ).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("executor stale tool sync failed", {
+                  integration: connection.integration,
+                  connection: connection.name,
+                  errorTag: Predicate.isTagged(error, "StorageError") ? "StorageError" : "Unknown",
+                }).pipe(Effect.as([] as readonly Tool[])),
+              ),
+              Effect.withSpan("executor.tools.sync_stale", {
+                attributes: {
+                  "executor.integration": connection.integration,
+                  "executor.connection": connection.name,
+                },
+              }),
+            );
+            if (!detached) {
+              urgent.push(rebuild);
+            } else {
+              deferred.push(queueDetachedToolSync(connection, ref, rebuild));
+            }
+            continue;
           }
+
+          (staleMarked || configRevised || mode === "converge" ? urgent : deferred).push(
+            produceConnectionTools(
+              integrationRow,
+              {
+                owner: connection.owner as Owner,
+                integration: IntegrationSlug.make(connection.integration),
+                name: ConnectionName.make(connection.name),
+              },
+              "background",
+            ).pipe(
+              // Best-effort, but never silent: the read still succeeds on the
+              // stale-but-working catalog and the peer rebuilds still finish,
+              // while the operator gets the connection that failed and why.
+              // Without this a connection whose upstream is permanently broken
+              // re-fails on every read and leaves no trace anywhere.
+              Effect.catch((error) =>
+                Effect.logWarning("executor stale tool sync failed", {
+                  integration: connection.integration,
+                  connection: connection.name,
+                  errorTag: Predicate.isTagged(error, "StorageError") ? "StorageError" : "Unknown",
+                }).pipe(Effect.as([] as readonly Tool[])),
+              ),
+              Effect.withSpan("executor.tools.sync_stale", {
+                attributes: {
+                  "executor.integration": connection.integration,
+                  "executor.connection": connection.name,
+                },
+              }),
+            ),
+          );
         }
         if (deferred.length > 0) {
           const background = yield* Effect.forkDetach(
-            Effect.all(deferred, { concurrency: "unbounded" }),
+            Effect.all(deferred, {
+              concurrency: config.forkFeatures?.has("detached-catalog-refresh")
+                ? "unbounded"
+                : STALE_TOOLS_SYNC_CONCURRENCY,
+            }),
           );
           config.waitUntil?.(
             new Promise<void>((resolve) => background.addObserver(() => resolve(undefined))),
@@ -5885,8 +5920,8 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // Run the stale sync with a bounded wait: a read pays at most the grace
     // budget for upstream listings it did not ask for, then serves the
     // persisted catalog while the rebuilds finish on their detached fibers
-    // (deduplicated per connection by the queue and `produceConnectionTools`,
-    // so overlapping reads share one rebuild). One slow or dead
+    // (deduplicated per connection by `produceConnectionTools`, so overlapping
+    // reads share one rebuild instead of stacking new ones). One slow or dead
     // MCP server must never gate every catalog read behind its network
     // timeout. Past the deadline the sync is best-effort by construction —
     // failures log and the stale-but-working catalog stays — so the fork
@@ -5897,7 +5932,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         syncStaleConnectionTools("bounded").pipe(
           Effect.catch((error) =>
             Effect.logWarning("executor stale tool sync scan failed", {
-              error: describeSyncFailure(error),
+              errorTag: Predicate.isTagged(error, "StorageError") ? "StorageError" : "Unknown",
             }),
           ),
         ),
@@ -5994,13 +6029,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const tool = rowToTool(row);
           if (!matchesToolFilter(tool, filter)) continue;
           if (!includeBlocked) {
-            const toolId = normalizedPolicyId(tool);
-            const requiresApproval = tool.annotations?.requiresApproval;
-            // Resolve in-line when the rule set needs no I/O; a per-tool
-            // Effect here dominated large catalog listings.
             const effective =
-              resolvePolicyFromRuleSetSync(toolId, policyRules, requiresApproval) ??
-              (yield* resolvePolicyFromRuleSet(toolId, policyRules, requiresApproval));
+              (forkFeatures.has("catalog-read-fastpath")
+                ? resolvePolicyFromRuleSetSync(
+                    normalizedPolicyId(tool),
+                    policyRules,
+                    tool.annotations?.requiresApproval,
+                  )
+                : undefined) ??
+              (yield* resolvePolicyFromRuleSet(
+                normalizedPolicyId(tool),
+                policyRules,
+                tool.annotations?.requiresApproval,
+              ));
             if (effective.action === "block") continue;
           }
           tools.push(tool);
@@ -6009,19 +6050,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const tool = staticToolToTool(entry);
           if (!matchesToolFilter(tool, filter)) continue;
           if (!includeBlocked) {
-            const toolId = normalizedPolicyId(tool);
-            const requiresApproval = tool.annotations?.requiresApproval;
-            // Resolve in-line when the rule set needs no I/O; a per-tool
-            // Effect here dominated large catalog listings.
             const effective =
-              resolvePolicyFromRuleSetSync(toolId, policyRules, requiresApproval) ??
-              (yield* resolvePolicyFromRuleSet(toolId, policyRules, requiresApproval));
+              (forkFeatures.has("catalog-read-fastpath")
+                ? resolvePolicyFromRuleSetSync(
+                    normalizedPolicyId(tool),
+                    policyRules,
+                    tool.annotations?.requiresApproval,
+                  )
+                : undefined) ??
+              (yield* resolvePolicyFromRuleSet(
+                normalizedPolicyId(tool),
+                policyRules,
+                tool.annotations?.requiresApproval,
+              ));
             if (effective.action === "block") continue;
           }
           tools.push(tool);
         }
         return tools;
-      }).pipe(withCatalogReader);
+      }).pipe((effect) =>
+        config.forkFeatures?.has("detached-catalog-refresh") ? withCatalogReader(effect) : effect,
+      );
 
     const toolsList = (filter?: ToolListFilter): Effect.Effect<readonly Tool[], StorageFailure> =>
       readTools(filter, { awaitStaleSync: true });
@@ -6031,32 +6080,42 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       options?: ToolSchemaOptions,
     ): Effect.Effect<ToolSchemaView | null, StorageFailure> =>
       Effect.gen(function* () {
-        const includeTypeScript = options?.typeScript ?? true;
+        if (
+          forkFeatures.has("catalog-read-fastpath") &&
+          !staticTools.has(String(address)) &&
+          !parseToolAddress(String(address))
+        )
+          return null;
+        const policyRules = yield* listActivePolicyRuleSet(
+          forkFeatures.has("catalog-read-fastpath")
+            ? staticTools.has(String(address))
+              ? String(address)
+              : String(address).replace(/^tools\./, "")
+            : undefined,
+        );
         const staticEntry = staticTools.get(String(address));
         if (staticEntry) {
           const tool = staticToolToTool(staticEntry);
-          const policyRules = yield* listActivePolicyRuleSet(normalizedPolicyId(tool));
           const effective = yield* resolvePolicyFromRuleSet(
             normalizedPolicyId(tool),
             policyRules,
             tool.annotations?.requiresApproval,
           );
           if (effective.action === "block") return null;
-          const preview = includeTypeScript
-            ? yield* Effect.tryPromise({
-                try: () =>
-                  buildToolTypeScriptPreview({
-                    inputSchema: tool.inputSchema,
-                    outputSchema: tool.outputSchema,
-                    defs: new Map(),
-                  }),
-                catch: (cause) =>
-                  storageFailureFromUnknown(
-                    "Failed to build static tool TypeScript preview",
-                    cause,
-                  ),
-              }).pipe(Effect.option)
-            : Option.none();
+          const preview = yield* Effect.tryPromise({
+            try: () =>
+              buildToolTypeScriptPreview({
+                inputSchema: tool.inputSchema,
+                outputSchema: tool.outputSchema,
+                defs: new Map(),
+              }),
+            catch: (cause) =>
+              storageFailureFromUnknown("Failed to build static tool TypeScript preview", cause),
+          }).pipe(Effect.option, (preview) =>
+            forkFeatures.has("catalog-read-fastpath") && options?.typeScript === false
+              ? Effect.succeed(Option.none())
+              : preview,
+          );
           return ToolSchemaView.make({
             address,
             name: tool.name,
@@ -6072,10 +6131,6 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
         const parsed = parseToolAddress(String(address));
         if (!parsed) return null;
-        // Same id `normalizedPolicyId` derives from the row this lookup returns.
-        const policyRules = yield* listActivePolicyRuleSet(
-          `${parsed.integration}.${parsed.owner}.${parsed.connection}.${parsed.tool}`,
-        );
         const row = yield* core.findFirst("tool", {
           where: (b: AnyCb) =>
             b.and(
@@ -6150,20 +6205,20 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // map per node), so passing the connection's full component set made a
         // single describe of a large spec cost seconds of CPU on the shared
         // session isolate. Unreferenced definitions never appear in the output.
-        // Callers that only need JSON Schema (MCP passthrough search/invoke)
-        // skip the TypeScript compile, the dominant cost of a schema read.
-        const preview = includeTypeScript
-          ? yield* Effect.tryPromise({
-              try: () =>
-                buildToolTypeScriptPreview({
-                  inputSchema,
-                  outputSchema: effectiveOutputSchema,
-                  defs: new Map(Object.entries(referenced)),
-                }),
-              catch: (cause) =>
-                storageFailureFromUnknown("Failed to build tool TypeScript preview", cause),
-            }).pipe(Effect.option)
-          : Option.none();
+        const preview = yield* Effect.tryPromise({
+          try: () =>
+            buildToolTypeScriptPreview({
+              inputSchema,
+              outputSchema: effectiveOutputSchema,
+              defs: new Map(Object.entries(referenced)),
+            }),
+          catch: (cause) =>
+            storageFailureFromUnknown("Failed to build tool TypeScript preview", cause),
+        }).pipe(Effect.option, (preview) =>
+          forkFeatures.has("catalog-read-fastpath") && options?.typeScript === false
+            ? Effect.succeed(Option.none())
+            : preview,
+        );
 
         const view = preview;
         return ToolSchemaView.make({

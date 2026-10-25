@@ -1,22 +1,14 @@
-/**
- * Integration alias resolution shared by every discovery surface: the
- * passthrough `search`/`integrations` MCP tools and the sandbox
- * `tools.search({ namespace })` call resolve the name a person would use
- * (`gmail`, `Google Calendar`) to the catalog slug the same way.
- */
+import { Effect } from "effect";
+import type { Executor } from "@executor-js/sdk";
+import type { Skill } from "./skills";
+import { ExecutionToolError } from "./errors";
 
-/** What `integrations` and `search` resolve aliases against. */
 export type IntegrationCatalogEntry = {
   readonly slug: string;
   readonly name: string;
   readonly description?: string;
 };
 
-/**
- * How an `integration` argument resolved: `exact` is the slug as given,
- * `alias` is one unambiguous match, `ambiguous` lists every slug that fits,
- * `none` matched nothing. The caller decides what to do with each.
- */
 export type IntegrationResolution =
   | { readonly kind: "exact" | "alias"; readonly slug: string }
   | { readonly kind: "ambiguous"; readonly slugs: readonly string[] }
@@ -31,13 +23,6 @@ const aliasTokens = (value: string): string[] =>
 
 const squash = (value: string): string => aliasTokens(value).join("");
 
-/**
- * Resolve a human alias to catalog slugs: `gmail` → `google_gmail`,
- * `Google Calendar` → `google_calendar`. Exact slug first; then a slug or
- * name that is the same once separators and case are dropped; then every
- * alias word appearing in the slug or name; last, every word appearing in
- * the description. The first tier with any match decides.
- */
 export const resolveIntegrationAlias = (
   input: string,
   catalog: readonly IntegrationCatalogEntry[],
@@ -61,12 +46,6 @@ export const resolveIntegrationAlias = (
   return { kind: "none" };
 };
 
-/**
- * Display-name text per slug for ranking, limited to words the slug does not
- * already have: `google_gmail` / "Gmail" adds nothing; `scrape_api` /
- * "ScrapeCreators" adds "creators scrapecreators" (the split words and the
- * one-word spelling a person types).
- */
 export const integrationAliasText = (
   catalog: readonly IntegrationCatalogEntry[],
 ): ReadonlyMap<string, string> => {
@@ -80,3 +59,43 @@ export const integrationAliasText = (
   }
   return aliases;
 };
+
+export const searchAliasContext = (
+  integrations: Pick<Executor["integrations"], "list">,
+  namespace: string | undefined,
+) =>
+  Effect.gen(function* () {
+    const catalog = yield* integrations
+      .list()
+      .pipe(
+        Effect.mapError(
+          (cause) =>
+            new ExecutionToolError({ message: "Failed to list integrations for search", cause }),
+        ),
+      );
+    const resolved =
+      namespace === undefined ? undefined : resolveIntegrationAlias(namespace, catalog);
+    return {
+      namespace: resolved?.kind === "alias" ? resolved.slug : namespace,
+      integrationAliases: integrationAliasText(catalog),
+    };
+  });
+
+export const ALIAS_EXECUTE_KNOWN_ANCHOR = "- When you already know";
+
+export const ALIAS_EXECUTE_SKILL_NAME = "execute";
+
+export const withAliasInstructions = (skill: Skill): Skill =>
+  skill.name !== ALIAS_EXECUTE_SKILL_NAME
+    ? skill
+    : {
+        ...skill,
+        body: skill.body
+          .split("\n")
+          .map((line) =>
+            line.startsWith(ALIAS_EXECUTE_KNOWN_ANCHOR)
+              ? '- When you already know the integration, narrow with `tools.search({ namespace: "github", query: "issues", limit: 3 })`. `namespace` accepts the slug or an unambiguous alias (`gmail` resolves to `google_gmail`); an alias that fits several integrations is used as a prefix instead.'
+              : line,
+          )
+          .join("\n"),
+      };

@@ -1,3 +1,4 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Deferred, Effect, Fiber, Predicate, Queue, Ref } from "effect";
 import type * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
@@ -20,20 +21,23 @@ import type { CodeExecutor, ExecuteResult, SandboxToolInvoker } from "@executor-
 
 import {
   defaultToolDiscoveryProvider,
+  searchTools,
+  type ToolDiscoveryInput,
   makeExecutorToolInvoker,
   listExecutorIntegrations,
   describeTool,
   type ToolDiscoveryProvider,
 } from "./tool-invoker";
 import { ExecutionToolError } from "./errors";
+import { connectedResultFields } from "./fork-tool-outcomes";
 import { buildExecuteDescription } from "./description";
-import { withAttachmentDelivery } from "./attachment-delivery";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export type ExecutionEngineConfig<E extends Cause.YieldableError = CodeExecutionError> = {
+  readonly forkFeatures?: ForkFeatures;
   readonly executor: Executor;
   readonly codeExecutor: CodeExecutor<E>;
   readonly toolDiscoveryProvider?: ToolDiscoveryProvider;
@@ -147,42 +151,14 @@ const truncate = (value: string, max: number): string =>
     ? `${value.slice(0, max)}\n... [truncated ${value.length - max} chars]`
     : value;
 
-/** Distinct connected tool paths in first-call order; never the call trace. */
-const distinctConnectedToolPaths = (toolPaths: readonly string[] | undefined): string[] => [
-  ...new Set(toolPaths ?? []),
-];
-
-const soleConnectedToolName = (toolPaths: readonly string[]): string | undefined =>
-  toolPaths.length === 1 ? toolPaths[0] : undefined;
-
-/** Keep the first 32 targets; repeated outcomes reduce as blocked > error > ok. */
-const connectedToolOutcomes = () => {
-  const calls = new Map<string, NonNullable<ExecuteResult["toolCalls"]>[number]>();
-  const severity = { ok: 0, error: 1, blocked: 2 } as const;
-  const record = (path: unknown, status: unknown) => {
-    if (
-      typeof path !== "string" ||
-      path.length > 512 ||
-      (status !== "ok" && status !== "error" && status !== "blocked")
-    )
-      return;
-    const canonical = path.startsWith("tools.") ? path : `tools.${path}`;
-    if (
-      canonical.length > 512 ||
-      !/^tools\.[a-zA-Z0-9_-]{1,64}\.(?:org|user)\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_.-]+$/.test(canonical)
-    )
-      return;
-    const normalized = canonical.slice("tools.".length);
-    const previous = calls.get(normalized);
-    if (previous ? severity[status] > severity[previous.status] : calls.size < 32) {
-      calls.set(normalized, { path: normalized, status });
-    }
-  };
-  return { record, values: () => [...calls.values()] };
+const soleConnectedToolName = (toolPaths: readonly string[] | undefined): string | undefined => {
+  const names = [...new Set(toolPaths ?? [])];
+  return names.length === 1 ? names[0] : undefined;
 };
 
 export const formatExecuteResult = (
   result: ExecuteResult,
+  { forkFeatures = forkFeaturesOff }: { readonly forkFeatures?: ForkFeatures } = {},
 ): {
   text: string;
   structured: Record<string, unknown>;
@@ -205,18 +181,7 @@ export const formatExecuteResult = (
   const emittedNote =
     emitted > 0 ? `${emitted} item${emitted === 1 ? "" : "s"} emitted to the user` : null;
   const emittedField = emitted > 0 ? { emitted } : {};
-  const toolPaths = distinctConnectedToolPaths(result.toolPaths);
-  const outcomes = connectedToolOutcomes();
-  if (Array.isArray(result.toolCalls)) {
-    for (const call of result.toolCalls) {
-      if (typeof call === "object" && call !== null) outcomes.record(call.path, call.status);
-    }
-  }
-  const toolCalls = outcomes.values();
-  const toolFields = {
-    ...(toolPaths.length > 0 ? { toolPaths } : {}),
-    ...(toolCalls.length > 0 ? { toolCalls } : {}),
-  };
+  const toolFields = forkFeatures.has("tool-usage") ? connectedResultFields(result) : {};
 
   if (result.error) {
     const parts = [`Error: ${result.error}`, ...(logText ? [`\nLogs:\n${logText}`] : [])];
@@ -239,7 +204,7 @@ export const formatExecuteResult = (
       ? `(no return value; ${emittedNote})`
       : "(no result)";
   const parts = [resultPart, ...(logText ? [`\nLogs:\n${logText}`] : [])];
-  const toolName = soleConnectedToolName(toolPaths);
+  const toolName = soleConnectedToolName(result.toolPaths);
   return {
     text: parts.join("\n"),
     structured: {
@@ -388,13 +353,8 @@ const makeFullInvoker = (
   invokeOptions: InvokeOptions,
   toolDiscoveryProvider: ToolDiscoveryProvider,
   onConnectedToolCall?: (path: string) => void,
-  onConnectedToolOutcome?: (path: string, status: "ok" | "error" | "blocked") => void,
 ): SandboxToolInvoker => {
-  const base = makeExecutorToolInvoker(executor, {
-    invokeOptions,
-    onConnectedToolCall,
-    onConnectedToolOutcome,
-  });
+  const base = makeExecutorToolInvoker(executor, { invokeOptions, onConnectedToolCall });
   return {
     invoke: ({ path, args }) => {
       if (path === "search") {
@@ -622,7 +582,19 @@ export type ExecutionEngine<E extends Cause.YieldableError = CodeExecutionError>
 export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecutionError>(
   config: ExecutionEngineConfig<E>,
 ): ExecutionEngine<E> => {
-  const { executor, codeExecutor, toolDiscoveryProvider = defaultToolDiscoveryProvider } = config;
+  const { executor, codeExecutor } = config;
+  const toolDiscoveryProvider =
+    config.toolDiscoveryProvider ??
+    (config.forkFeatures?.has("integration-aliases")
+      ? {
+          searchTools: ({ executor, query, namespace, limit, offset }: ToolDiscoveryInput) =>
+            searchTools(executor, query, limit, {
+              namespace,
+              offset,
+              forkFeatures: config.forkFeatures,
+            }),
+        }
+      : defaultToolDiscoveryProvider);
   const pausedExecutions = new Map<string, InternalPausedExecution<E>>();
   // Every sandbox fiber `startPausableExecution` still has in flight.
   //
@@ -770,23 +742,15 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       });
 
     const toolPaths: string[] = [];
-    const toolCalls = connectedToolOutcomes();
     const invoker = makeFullInvoker(
       executor,
       { onElicitation: elicitationHandler },
       toolDiscoveryProvider,
       (path) => toolPaths.push(path),
-      toolCalls.record,
     );
-    const delivery = withAttachmentDelivery(invoker);
     fiber = yield* Effect.forkDetach(
-      codeExecutor.execute(code, delivery.invoker).pipe(
-        Effect.map(delivery.finish),
-        Effect.map((result) => ({
-          ...result,
-          ...(toolPaths.length > 0 ? { toolPaths } : {}),
-          ...(toolCalls.values().length > 0 ? { toolCalls: toolCalls.values() } : {}),
-        })),
+      codeExecutor.execute(code, invoker).pipe(
+        Effect.map((result) => (toolPaths.length === 0 ? result : { ...result, toolPaths })),
         Effect.withSpan("executor.code.exec"),
       ),
     );
@@ -915,7 +879,6 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       "mcp.execute.code_length": code.length,
     });
     const toolPaths: string[] = [];
-    const toolCalls = connectedToolOutcomes();
     const invoker = makeFullInvoker(
       executor,
       {
@@ -923,16 +886,9 @@ export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecu
       },
       toolDiscoveryProvider,
       (path) => toolPaths.push(path),
-      toolCalls.record,
     );
-    const delivery = withAttachmentDelivery(invoker);
-    const result = yield* codeExecutor.execute(code, delivery.invoker).pipe(
-      Effect.map(delivery.finish),
-      Effect.map((result) => ({
-        ...result,
-        ...(toolPaths.length > 0 ? { toolPaths } : {}),
-        ...(toolCalls.values().length > 0 ? { toolCalls: toolCalls.values() } : {}),
-      })),
+    const result = yield* codeExecutor.execute(code, invoker).pipe(
+      Effect.map((result) => (toolPaths.length === 0 ? result : { ...result, toolPaths })),
       Effect.withSpan("executor.code.exec"),
     );
     yield* annotateExecuteOutcome(result);

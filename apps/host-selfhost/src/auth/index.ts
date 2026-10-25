@@ -1,3 +1,4 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Layer } from "effect";
 
 import { IdentityProvider, MemberDirectory } from "@executor-js/api/server";
@@ -5,7 +6,7 @@ import { IdentityProvider, MemberDirectory } from "@executor-js/api/server";
 import { loadConfig } from "../config";
 import type { SelfHostDbHandle } from "../db/self-host-db";
 import { BetterAuth, buildBetterAuth, type BetterAuthHandle } from "./better-auth";
-import { betterAuthIdentityLayer } from "./identity";
+import { makeBetterAuthIdentityLayer } from "./identity";
 import { betterAuthMemberDirectoryLayer } from "./member-directory";
 import { consentRedirectClientId, withClientName, withForcedMcpConsent } from "./force-mcp-consent";
 import { rewriteInvalidOrigin } from "./invalid-origin-help";
@@ -43,6 +44,7 @@ export interface ResolvedAuthProviders {
 
 export const resolveAuthProviders = async (
   dbHandle: SelfHostDbHandle,
+  forkFeatures: ForkFeatures = forkFeaturesOff,
 ): Promise<ResolvedAuthProviders> => {
   const betterAuth = await buildBetterAuth(dbHandle.client);
   const betterAuthLayer = Layer.succeed(BetterAuth)(betterAuth);
@@ -83,7 +85,7 @@ export const resolveAuthProviders = async (
   };
 
   return {
-    identityLayer: betterAuthIdentityLayer.pipe(Layer.provide(betterAuthLayer)),
+    identityLayer: makeBetterAuthIdentityLayer(forkFeatures).pipe(Layer.provide(betterAuthLayer)),
     memberDirectoryLayer: betterAuthMemberDirectoryLayer.pipe(Layer.provide(betterAuthLayer)),
     authHandler,
     betterAuth,

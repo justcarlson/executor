@@ -1,3 +1,4 @@
+export { AccountUnavailable } from "./account/fork-membership-errors";
 export { ExecutorApi, CoreExecutorApi, addGroup } from "./api";
 export {
   checkForUpdate,
@@ -38,11 +39,11 @@ export {
 } from "./oauth-popup";
 export { PoliciesApi } from "./policies/api";
 export { ArtifactsApi } from "./artifacts/api";
+export { makeAccountHttpApi } from "./account/fork-account-api";
 export {
   AccountApi,
   AccountHttpApi,
   AccountError,
-  AccountUnavailable,
   AccountForbidden,
   AccountNoOrganization,
   AccountUnauthorized,

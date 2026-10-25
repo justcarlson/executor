@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
 // ---------------------------------------------------------------------------
 // ExecutorApp.make — the single composition facade every product host calls.
 //
@@ -268,11 +269,12 @@ export interface AppExtensions {
 // The identity seam's failure channel (`Unauthorized | NoOrganization |
 // Unavailable`) lives in `./identity` now that BOTH apps provide the neutral
 // `IdentityProvider`. The failure strategy renders it: self-host catches it into
-// 401/403/503 text (`textFailureStrategy`);
+// 401/403/503 text (`textFailureStrategy`; it never produces `Unavailable`);
 // cloud's strategy renders its exact 401/403/503 `{ error, code }` JSON bytes.
 export type { IdentityFailure };
 
 export interface AppConfig<RStrategy, McpExport> {
+  readonly forkFeatures?: ForkFeatures;
   /**
    * Serve the typed API under this path prefix ("/api"). make() builds the
    * `router.prefixed(mountPrefix)` view internally; omit to serve at root.
@@ -538,10 +540,10 @@ export const make = <
   const apiLive: AppRouteLayer = providers.account
     ? Layer.merge(
         pluginApiLive,
-        makeAccountApiLayer(
-          providers.account as Layer.Layer<unknown, never, RAcct>,
-          prefixedRouter ? { router: prefixedRouter } : {},
-        ) as AppRouteLayer,
+        makeAccountApiLayer(providers.account as Layer.Layer<unknown, never, RAcct>, {
+          ...(prefixedRouter ? { router: prefixedRouter } : {}),
+          forkFeatures: config.forkFeatures,
+        }) as AppRouteLayer,
       )
     : pluginApiLive;
 
