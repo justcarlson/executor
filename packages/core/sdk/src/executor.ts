@@ -1,4 +1,5 @@
-import type { ForkFeatures } from "./fork-features";
+import { forkFeaturesOff, type ForkFeatures } from "./fork-features";
+import { prepareToolPolicies } from "./fork-prepared-policies";
 import {
   Cause,
   Deferred,
@@ -473,7 +474,10 @@ export type Executor<TPlugins extends readonly AnyPlugin[] = readonly []> = {
 
   readonly tools: {
     readonly list: (filter?: ToolListFilter) => Effect.Effect<readonly Tool[], StorageFailure>;
-    readonly schema: (address: ToolAddress) => Effect.Effect<ToolSchemaView | null, StorageFailure>;
+    readonly schema: (
+      address: ToolAddress,
+      options?: ToolSchemaOptions,
+    ) => Effect.Effect<ToolSchemaView | null, StorageFailure>;
   };
 
   readonly providers: {
@@ -856,6 +860,10 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    * like `platformView`'s blanket `writes: "denied"`.
    */
   readonly orgWrites?: OrgWriteAccess | "request";
+}
+
+export interface ToolSchemaOptions {
+  readonly typeScript?: boolean;
 }
 
 /** Default freshness window for remote-catalog connections (see
@@ -1898,6 +1906,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
   config: ExecutorConfig<TPlugins>,
 ): Effect.Effect<Executor<TPlugins>, StorageFailure> =>
   Effect.gen(function* () {
+    const forkFeatures = config.forkFeatures ?? forkFeaturesOff;
     const defaultPlugins = (): TPlugins => {
       const empty: readonly AnyPlugin[] = [];
       return empty as TPlugins;
@@ -5441,7 +5450,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       toolId: string,
       rules: readonly ToolPolicyProviderRule[],
     ): EffectivePolicy => {
-      for (const rule of [...rules].sort(compareProviderPolicyRule)) {
+      for (const rule of forkFeatures.has("catalog-read-fastpath")
+        ? rules
+        : [...rules].sort(compareProviderPolicyRule)) {
         if (!matchPattern(rule.pattern, toolId)) continue;
         return {
           action: rule.action,
@@ -5459,7 +5470,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       };
     };
 
-    const listActivePolicyRuleSet = (): Effect.Effect<ActivePolicyRuleSet, StorageFailure> =>
+    const listActivePolicyRuleSet = (
+      forToolId?: string,
+    ): Effect.Effect<ActivePolicyRuleSet, StorageFailure> =>
       activeToolPolicyProvider
         ? // Batched per-operation resolver: fetch all policy + connection state
           // once, then resolve every tool in this operation against that
@@ -5482,12 +5495,46 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
                 Effect.map((rules) => ({
                   kind: "provider" as const,
                   provider: activeToolPolicyProvider!,
-                  rules,
+                  rules: forkFeatures.has("catalog-read-fastpath")
+                    ? [...rules].sort(compareProviderPolicyRule)
+                    : rules,
                 })),
               )
         : core
-            .findMany("tool_policy", {})
-            .pipe(Effect.map((rows) => ({ kind: "global" as const, rows })));
+            .findMany(
+              "tool_policy",
+              forkFeatures.has("catalog-read-fastpath") && forToolId !== undefined
+                ? {
+                    where: (b: AnyCb) =>
+                      b.or(b("pattern", "=", forToolId), b("pattern", "contains", "*")),
+                  }
+                : {},
+            )
+            .pipe(
+              Effect.map((rows): ActivePolicyRuleSet => {
+                if (forkFeatures.has("catalog-read-fastpath")) {
+                  const prepared = prepareToolPolicies(rows, ownerRankForRow);
+                  return {
+                    kind: "prepared",
+                    dynamicScope: undefined,
+                    resolve: ({ toolId, defaultRequiresApproval }) =>
+                      prepared.resolveEffective(toolId, defaultRequiresApproval),
+                  };
+                }
+                return { kind: "global", rows };
+              }),
+            );
+
+    const resolvePolicyFromRuleSetSync = (
+      toolId: string,
+      ruleSet: ActivePolicyRuleSet,
+      defaultRequiresApproval?: boolean,
+    ): EffectivePolicy | undefined =>
+      ruleSet.kind === "prepared"
+        ? ruleSet.resolve({ toolId, defaultRequiresApproval })
+        : ruleSet.kind === "provider" && !ruleSet.provider.resolve
+          ? resolveProviderPolicyFromRules(toolId, ruleSet.rules ?? [])
+          : undefined;
 
     const resolvePolicyFromRuleSet = (
       toolId: string,
@@ -5795,11 +5842,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const tool = rowToTool(row);
           if (!matchesToolFilter(tool, filter)) continue;
           if (!includeBlocked) {
-            const effective = yield* resolvePolicyFromRuleSet(
-              normalizedPolicyId(tool),
-              policyRules,
-              tool.annotations?.requiresApproval,
-            );
+            const effective =
+              (forkFeatures.has("catalog-read-fastpath")
+                ? resolvePolicyFromRuleSetSync(
+                    normalizedPolicyId(tool),
+                    policyRules,
+                    tool.annotations?.requiresApproval,
+                  )
+                : undefined) ??
+              (yield* resolvePolicyFromRuleSet(
+                normalizedPolicyId(tool),
+                policyRules,
+                tool.annotations?.requiresApproval,
+              ));
             if (effective.action === "block") continue;
           }
           tools.push(tool);
@@ -5808,11 +5863,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           const tool = staticToolToTool(entry);
           if (!matchesToolFilter(tool, filter)) continue;
           if (!includeBlocked) {
-            const effective = yield* resolvePolicyFromRuleSet(
-              normalizedPolicyId(tool),
-              policyRules,
-              tool.annotations?.requiresApproval,
-            );
+            const effective =
+              (forkFeatures.has("catalog-read-fastpath")
+                ? resolvePolicyFromRuleSetSync(
+                    normalizedPolicyId(tool),
+                    policyRules,
+                    tool.annotations?.requiresApproval,
+                  )
+                : undefined) ??
+              (yield* resolvePolicyFromRuleSet(
+                normalizedPolicyId(tool),
+                policyRules,
+                tool.annotations?.requiresApproval,
+              ));
             if (effective.action === "block") continue;
           }
           tools.push(tool);
@@ -5825,9 +5888,22 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
 
     const toolSchema = (
       address: ToolAddress,
+      options?: ToolSchemaOptions,
     ): Effect.Effect<ToolSchemaView | null, StorageFailure> =>
       Effect.gen(function* () {
-        const policyRules = yield* listActivePolicyRuleSet();
+        if (
+          forkFeatures.has("catalog-read-fastpath") &&
+          !staticTools.has(String(address)) &&
+          !parseToolAddress(String(address))
+        )
+          return null;
+        const policyRules = yield* listActivePolicyRuleSet(
+          forkFeatures.has("catalog-read-fastpath")
+            ? staticTools.has(String(address))
+              ? String(address)
+              : String(address).replace(/^tools\./, "")
+            : undefined,
+        );
         const staticEntry = staticTools.get(String(address));
         if (staticEntry) {
           const tool = staticToolToTool(staticEntry);
@@ -5846,7 +5922,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
               }),
             catch: (cause) =>
               storageFailureFromUnknown("Failed to build static tool TypeScript preview", cause),
-          }).pipe(Effect.option);
+          }).pipe(Effect.option, (preview) =>
+            forkFeatures.has("catalog-read-fastpath") && options?.typeScript === false
+              ? Effect.succeed(Option.none())
+              : preview,
+          );
           return ToolSchemaView.make({
             address,
             name: tool.name,
@@ -5945,7 +6025,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             }),
           catch: (cause) =>
             storageFailureFromUnknown("Failed to build tool TypeScript preview", cause),
-        }).pipe(Effect.option);
+        }).pipe(Effect.option, (preview) =>
+          forkFeatures.has("catalog-read-fastpath") && options?.typeScript === false
+            ? Effect.succeed(Option.none())
+            : preview,
+        );
 
         const view = preview;
         return ToolSchemaView.make({

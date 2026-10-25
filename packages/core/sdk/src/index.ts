@@ -436,6 +436,7 @@ export {
   type Executor,
   type ExecutorAdmin,
   type ExecutorConfig,
+  type ToolSchemaOptions,
   type ExecutorDb,
   type ExecutorDbFactory,
   type ExecutorDbInput,
