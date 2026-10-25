@@ -1,4 +1,17 @@
 import type { GuidanceText, GuidanceSkill, GuidanceInstructions } from "./fork-guidance-types";
-export const text: GuidanceText = (_features, _key, upstream) => upstream;
-export const skill: GuidanceSkill = (_features, upstream) => upstream;
-export const instructions: GuidanceInstructions = (_features, upstream) => upstream;
+import {
+  forkPassthroughText,
+  forkSearchInvokeSkill,
+  forkPassthroughInstructions,
+} from "./fork-passthrough-guidance";
+import { codemodeInstructions } from "./codemode-instructions";
+export const text: GuidanceText = (features, key, upstream) =>
+  features.has("lean-guidance") ? forkPassthroughText(features, key) : upstream;
+export const skill: GuidanceSkill = (features, upstream) =>
+  features.has("lean-guidance") ? forkSearchInvokeSkill(upstream) : upstream;
+export const instructions: GuidanceInstructions = (features, upstream, mode) =>
+  features.has("lean-guidance")
+    ? mode === "codemode"
+      ? codemodeInstructions(features)
+      : forkPassthroughInstructions(features)
+    : upstream;
