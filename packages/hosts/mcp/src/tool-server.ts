@@ -678,8 +678,9 @@ const outputItemContent = (item: ExecuteOutputItem): ContentBlock[] => {
 const toMcpOutputResult = (
   result: FormattedExecuteInput,
   output: readonly ExecuteOutputItem[],
+  forkFeatures?: ForkFeatures,
 ): McpToolResult => {
-  const formatted = formatExecuteResult(result);
+  const formatted = formatExecuteResult(result, { forkFeatures });
   const content = output.flatMap(outputItemContent);
   const extraText: string[] = [];
   if (result.error) {
@@ -701,9 +702,10 @@ const toMcpOutputResult = (
   };
 };
 
-const toMcpResult = (result: FormattedExecuteInput): McpToolResult => {
-  if (result.output && result.output.length > 0) return toMcpOutputResult(result, result.output);
-  const formatted = formatExecuteResult(result);
+const toMcpResult = (result: FormattedExecuteInput, forkFeatures?: ForkFeatures): McpToolResult => {
+  if (result.output && result.output.length > 0)
+    return toMcpOutputResult(result, result.output, forkFeatures);
+  const formatted = formatExecuteResult(result, { forkFeatures });
   return {
     content: [{ type: "text", text: formatted.text }],
     structuredContent: formatted.structured,
@@ -719,11 +721,14 @@ const toMcpResult = (result: FormattedExecuteInput): McpToolResult => {
  * result, and a success unwraps to the tool's `data`. Everything else
  * (sandbox error, emitted output) keeps the codemode rendering.
  */
-const toPassthroughResult = (outcome: FormattedExecuteInput): McpToolResult => {
+const toPassthroughResult = (
+  outcome: FormattedExecuteInput,
+  forkFeatures?: ForkFeatures,
+): McpToolResult => {
   const value = outcome.result;
-  if (outcome.error || !isToolResult(value)) return toMcpResult(outcome);
+  if (outcome.error || !isToolResult(value)) return toMcpResult(outcome, forkFeatures);
   if (value.ok) {
-    return toMcpResult({ ...outcome, result: value.data });
+    return toMcpResult({ ...outcome, result: value.data }, forkFeatures);
   }
   const message = `${value.error.code}: ${value.error.message}`;
   return {
@@ -776,10 +781,13 @@ const toMcpPausedResult = (formatted: ReturnType<typeof formatPausedExecution>):
 
 export const formatMcpExecutionOutcome = (
   outcome: ExecutionResult,
-  options?: { readonly pausedDeadline?: PausedExecutionDeadline },
+  options?: {
+    readonly pausedDeadline?: PausedExecutionDeadline;
+    readonly forkFeatures?: ForkFeatures;
+  },
 ): McpToolResult =>
   outcome.status === "completed"
-    ? toMcpResult(outcome.result)
+    ? toMcpResult(outcome.result, options?.forkFeatures)
     : toMcpPausedResult(
         formatPausedExecution(outcome.execution, { deadline: options?.pausedDeadline }),
       );
@@ -1680,7 +1688,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         .execute(code, {
           onElicitation: makeMcpElicitationHandler(server, extra.requestId, debugLog),
         })
-        .pipe(Effect.map(toMcpResult));
+        .pipe(Effect.map((result) => toMcpResult(result, config.forkFeatures)));
 
     const executeCode = (
       code: string,
@@ -1721,7 +1729,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             ? yield* requireUserResumeApproval(outcome.execution.id)
             : toMcpPausedResult(formatPausedExecution(outcome.execution, { deadline }));
         }
-        return toMcpResult(outcome.result);
+        return toMcpResult(outcome.result, config.forkFeatures);
       }).pipe(
         Effect.withSpan("mcp.host.tool.execute", {
           attributes: {
@@ -1838,7 +1846,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         if (outcome.status === "paused") {
           return yield* formatPausedModelResult(outcome.execution, "execute_action");
         }
-        return toMcpResult(outcome.result);
+        return toMcpResult(outcome.result, config.forkFeatures);
       }).pipe(
         Effect.withSpan("mcp.host.tool.execute_action", {
           attributes: {
@@ -1890,7 +1898,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         if (outcome.status === "paused") {
           return yield* formatPausedModelResult(outcome.execution, "resume");
         }
-        return toMcpResult(outcome.result);
+        return toMcpResult(outcome.result, config.forkFeatures);
       }).pipe(
         Effect.withSpan("mcp.host.tool.resume", {
           attributes: {
@@ -1974,7 +1982,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           yield* onExecutionPaused(outcome.execution.id, deadline);
         }
         return outcome.status === "completed"
-          ? toMcpResult(outcome.result)
+          ? toMcpResult(outcome.result, config.forkFeatures)
           : yield* requireUserResumeApproval(outcome.execution.id);
       }).pipe(
         Effect.withSpan("mcp.host.tool.resume.browser_approval", {
@@ -2031,7 +2039,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           onElicitation,
         });
         if (unanswerable) return elicitationUnsupportedResult(String(address), unanswerable);
-        return toPassthroughResult(outcome);
+        return toPassthroughResult(outcome, config.forkFeatures);
       }).pipe(
         Effect.withSpan("mcp.host.tool.execute", {
           attributes: {

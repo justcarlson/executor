@@ -9,6 +9,7 @@ import {
   type InMemoryMcpSessionStore,
 } from "@executor-js/host-mcp/in-memory-session-store";
 
+import { makeToolUsageSessionStore } from "./tool-usage-sessions";
 import { selfHostAnalytics } from "../analytics";
 import { ErrorCaptureLive } from "../observability";
 import { SelfHostDb, type SelfHostDbHandle } from "../db/self-host-db";
@@ -40,7 +41,9 @@ export const makeSelfHostMcpSessionStore = (
   sessionIdleTtlMs?: number,
   forkFeatures: ForkFeatures = forkFeaturesOff,
 ): InMemoryMcpSessionStore =>
-  makeInMemoryMcpSessionStore(
+  (forkFeatures.has("tool-usage")
+    ? makeToolUsageSessionStore(db.client)
+    : makeInMemoryMcpSessionStore)(
     makeMcpBuildServer(
       makeSelfHostExecutionStackLayer(forkFeatures).pipe(
         Layer.provide(Layer.succeed(SelfHostDb)(db)),

@@ -1,4 +1,4 @@
-import type { ForkFeatures } from "@executor-js/sdk/core";
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Deferred, Effect, Fiber, Predicate, Queue, Ref } from "effect";
 import type * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
@@ -27,6 +27,7 @@ import {
   type ToolDiscoveryProvider,
 } from "./tool-invoker";
 import { ExecutionToolError } from "./errors";
+import { connectedResultFields } from "./fork-tool-outcomes";
 import { buildExecuteDescription } from "./description";
 
 // ---------------------------------------------------------------------------
@@ -155,6 +156,7 @@ const soleConnectedToolName = (toolPaths: readonly string[] | undefined): string
 
 export const formatExecuteResult = (
   result: ExecuteResult,
+  { forkFeatures = forkFeaturesOff }: { readonly forkFeatures?: ForkFeatures } = {},
 ): {
   text: string;
   structured: Record<string, unknown>;
@@ -177,6 +179,7 @@ export const formatExecuteResult = (
   const emittedNote =
     emitted > 0 ? `${emitted} item${emitted === 1 ? "" : "s"} emitted to the user` : null;
   const emittedField = emitted > 0 ? { emitted } : {};
+  const toolFields = forkFeatures.has("tool-usage") ? connectedResultFields(result) : {};
 
   if (result.error) {
     const parts = [`Error: ${result.error}`, ...(logText ? [`\nLogs:\n${logText}`] : [])];
@@ -185,6 +188,7 @@ export const formatExecuteResult = (
       structured: {
         status: "error",
         error: result.error,
+        ...toolFields,
         ...emittedField,
         logs: result.logs ?? [],
       },
@@ -205,6 +209,7 @@ export const formatExecuteResult = (
       status: "completed",
       result: result.result ?? null,
       ...(toolName ? { toolName } : {}),
+      ...toolFields,
       ...emittedField,
       logs: result.logs ?? [],
     },

@@ -1,7 +1,5 @@
 import type { SandboxToolInvoker } from "@executor-js/codemode-core";
 import type { ForkFeatures } from "@executor-js/sdk/core";
-import type { PreparedInvocation } from "./fork-runtime-types";
-export const prepareToolOutcomes = (
-  _invoker: SandboxToolInvoker,
-  _features: ForkFeatures,
-): PreparedInvocation | undefined => undefined;
+import { withToolOutcomes } from "./fork-tool-outcomes";
+export const prepareToolOutcomes = (invoker: SandboxToolInvoker, features: ForkFeatures) =>
+  features.has("tool-usage") ? withToolOutcomes(invoker) : undefined;

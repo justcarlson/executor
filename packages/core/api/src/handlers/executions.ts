@@ -1,5 +1,5 @@
 import { HttpApiBuilder } from "effect/unstable/httpapi";
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 import { Schema } from "effect";
 
 import { ExecutorApi } from "../api";
@@ -9,6 +9,11 @@ import { TOOL_CALL_CONTRACT_MESSAGE } from "@executor-js/host-mcp/tool-call-code
 import { PENDING_APPROVAL_TTL_MS } from "@executor-js/sdk";
 import { ExecutionEngineService, ExecutorService } from "../services";
 import { capture, captureEngineError } from "@executor-js/api";
+import { HostConfig } from "../server/scoped-executor";
+
+const requestForkFeatures = Effect.serviceOption(HostConfig).pipe(
+  Effect.map((config) => Option.getOrUndefined(config)?.forkFeatures),
+);
 
 class ExecutionNotFoundError extends Schema.TaggedErrorClass<ExecutionNotFoundError>()(
   "ExecutionNotFoundError",
@@ -157,7 +162,8 @@ const resumeFromPendingApproval = (executionId: string, action: "accept" | "decl
     );
 
     if (outcome.status === "completed") {
-      const formatted = formatExecuteResult(outcome.result);
+      const forkFeatures = yield* requestForkFeatures;
+      const formatted = formatExecuteResult(outcome.result, { forkFeatures });
       return {
         status: "completed" as const,
         text: formatted.text,
@@ -210,7 +216,8 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
           );
 
           if (outcome.status === "completed") {
-            const formatted = formatExecuteResult(outcome.result);
+            const forkFeatures = yield* requestForkFeatures;
+            const formatted = formatExecuteResult(outcome.result, { forkFeatures });
             return {
               status: "completed" as const,
               text: formatted.text,
@@ -265,7 +272,8 @@ export const ExecutionsHandlers = HttpApiBuilder.group(ExecutorApi, "executions"
           }
 
           if (result.status === "completed") {
-            const formatted = formatExecuteResult(result.result);
+            const forkFeatures = yield* requestForkFeatures;
+            const formatted = formatExecuteResult(result.result, { forkFeatures });
             return {
               status: "completed" as const,
               text: formatted.text,
