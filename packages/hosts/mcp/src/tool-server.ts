@@ -1590,9 +1590,19 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
 ): Effect.Effect<McpServer, McpPassthroughUnavailableError> =>
   Effect.gen(function* () {
     const engine = "engine" in config ? config.engine : createExecutionEngine(config);
-    const description =
-      config.description ??
-      (yield* engine.getDescription.pipe(Effect.withSpan("mcp.host.get_description")));
+    const loadDescription = config.forkFeatures?.has("lazy-execute-description")
+      ? yield* Effect.cached(
+          config.description !== undefined
+            ? Effect.succeed(config.description)
+            : engine.getDescription.pipe(Effect.withSpan("mcp.host.get_description")),
+        )
+      : Effect.succeed("");
+    const description = config.forkFeatures?.has("lazy-execute-description")
+      ? config.mode === "passthrough"
+        ? ""
+        : yield* loadDescription
+      : (config.description ??
+        (yield* engine.getDescription.pipe(Effect.withSpan("mcp.host.get_description"))));
     // The same live integration inventory the description carries, re-used by
     // the `skills` tool so the `execute` guide lists what is connected too.
     const executeInventory = extractInventory(description);
@@ -2159,7 +2169,16 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           },
         },
         ({ name }, extra) =>
-          runToolEffect(Effect.succeed(skillsResult(name, executeInventory, skillCatalog)), extra),
+          runToolEffect(
+            config.forkFeatures?.has("lazy-execute-description")
+              ? loadDescription.pipe(
+                  Effect.map((description) =>
+                    skillsResult(name, extractInventory(description), skillCatalog),
+                  ),
+                )
+              : Effect.succeed(skillsResult(name, executeInventory, skillCatalog)),
+            extra,
+          ),
       ),
     ).pipe(
       Effect.withSpan("mcp.host.register_tool", {
