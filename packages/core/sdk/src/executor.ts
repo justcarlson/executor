@@ -36,6 +36,7 @@ import {
 import { makeFumaBlobStore, pluginBlobStore, type BlobStore, type OwnerPartitions } from "./blob";
 import { makePendingApprovalStore, type PendingApprovalStore } from "./pending-approval";
 import { coreToolsPlugin } from "./core-tools";
+import { catalogRowsMatch } from "./fork-catalog-rows";
 import type {
   Connection,
   ConnectionInputOrigin,
@@ -869,6 +870,7 @@ export interface ToolSchemaOptions {
 /** Default freshness window for remote-catalog connections (see
  *  `ExecutorConfig.toolsSyncTtlMs`). */
 export const DEFAULT_TOOLS_SYNC_TTL_MS = 15 * 60 * 1000;
+export const CATALOG_READER_WAIT_MS = 1000;
 
 /** Default wait budget a tools read spends on stale-catalog rebuilds before
  *  answering from the persisted rows (see `ExecutorConfig.toolsSyncGraceMs`).
@@ -3525,12 +3527,55 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const persistCatalog = <A, E>(effect: Effect.Effect<A, E>) =>
       catalogPersistLock.withPermits(1)(transaction(effect));
 
+    type ToolProductionMode = "explicit" | "background" | "detached";
+    let catalogReaders: { count: number; readonly done: Deferred.Deferred<void> } | null = null;
+    const withCatalogReader = <A, E>(effect: Effect.Effect<A, E>) =>
+      Effect.acquireUseRelease(
+        Effect.sync(() => {
+          if (toolsSyncGraceMs === null) return null;
+          const readers = catalogReaders ?? { count: 0, done: Deferred.makeUnsafe<void>() };
+          readers.count += 1;
+          catalogReaders = readers;
+          return readers;
+        }),
+        () => effect,
+        (readers) =>
+          Effect.suspend(() => {
+            if (readers === null || --readers.count !== 0) return Effect.void;
+            catalogReaders = null;
+            return Deferred.succeed(readers.done, undefined);
+          }),
+      );
+    const yieldBackgroundCatalog = (
+      mode: () => ToolProductionMode,
+      foreground: Deferred.Deferred<void>,
+    ) =>
+      Effect.suspend(() =>
+        mode() !== "detached"
+          ? Effect.void
+          : Effect.sleep(0).pipe(
+              Effect.andThen(
+                Effect.suspend(() =>
+                  catalogReaders === null ? Effect.void : Deferred.await(catalogReaders.done),
+                ),
+              ),
+              Effect.raceFirst(Deferred.await(foreground)),
+              // Continuous readers may delay each phase by at most one second.
+              Effect.timeoutOption(CATALOG_READER_WAIT_MS),
+              Effect.asVoid,
+            ),
+      );
+
     const produceConnectionToolsUnshared = (
       integrationRow: IntegrationRow,
       ref: ConnectionRef,
-      mode: () => "explicit" | "background",
+      mode: () => ToolProductionMode,
+      foreground?: Deferred.Deferred<void>,
     ): Effect.Effect<readonly Tool[], IntegrationNotFoundError | StorageFailure> =>
       Effect.gen(function* () {
+        if (config.forkFeatures?.has("detached-catalog-refresh") && foreground) {
+          yield* yieldBackgroundCatalog(mode, foreground);
+        }
         const runtime = runtimes.get(integrationRow.plugin_id);
         const keys = yield* Effect.try({
           try: () => ownedKeys(ref.owner),
@@ -3565,10 +3610,19 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // Successful syncs also clear stale sync-failure health records, while
         // preserving genuine health-check outcomes.
         const stampSynced = (row: ConnectionRow | null) =>
-          core.updateMany("connection", {
-            where: connectionWhere,
-            set: syncedSet(row),
-          });
+          config.forkFeatures?.has("detached-catalog-refresh")
+            ? findConnectionRow(ref).pipe(
+                Effect.flatMap((fresh) =>
+                  core.updateMany("connection", {
+                    where: connectionWhere,
+                    set: syncedSet(fresh),
+                  }),
+                ),
+              )
+            : core.updateMany("connection", {
+                where: connectionWhere,
+                set: syncedSet(row),
+              });
         // A failing sync must not bury a recorded dead grant's `expired`
         // verdict: this sync's own credential resolution is what discovers
         // invalid_grant (refresh → recorder), so by failure time the row
@@ -3682,6 +3736,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             ),
           );
 
+        if (config.forkFeatures?.has("detached-catalog-refresh") && foreground) {
+          yield* yieldBackgroundCatalog(mode, foreground);
+        }
         if (result.incomplete === true) {
           // Non-authoritative listing (integration unreachable, auth not ready).
           // Keep the existing catalog — replacing it would wipe working tools
@@ -3700,7 +3757,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }
 
         if (
-          mode() === "background" &&
+          (config.forkFeatures?.has("detached-catalog-refresh")
+            ? mode() !== "explicit"
+            : mode() === "background") &&
           runtime.plugin.remoteToolCatalog === true &&
           result.tools.length === 0
         ) {
@@ -3748,8 +3807,37 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           created_at: now,
         }));
 
+        if (config.forkFeatures?.has("detached-catalog-refresh") && foreground) {
+          yield* yieldBackgroundCatalog(mode, foreground);
+        }
         yield* persistCatalog(
           Effect.gen(function* () {
+            if (config.forkFeatures?.has("detached-catalog-refresh")) {
+              const toolColumns = [
+                "plugin_id",
+                "name",
+                "description",
+                "input_schema",
+                "output_schema",
+                "annotations",
+              ] as const;
+              const definitionColumns = ["plugin_id", "name", "schema"] as const;
+              const storedTools = yield* core.findMany("tool", { where, select: toolColumns });
+              const storedDefinitions = yield* core.findMany("definition", {
+                where,
+                select: definitionColumns,
+              });
+              const unchanged = yield* Effect.try({
+                try: () =>
+                  catalogRowsMatch(storedTools, toolRows, toolColumns) &&
+                  catalogRowsMatch(storedDefinitions, definitionRows, definitionColumns),
+                catch: (cause) => storageFailureFromUnknown("comparing tool catalog", cause),
+              });
+              if (unchanged) {
+                yield* stampSynced(existingRow);
+                return;
+              }
+            }
             yield* core.deleteMany("tool", { where });
             yield* core.deleteMany("definition", { where });
             yield* core.createMany("tool", toolRows);
@@ -3783,28 +3871,44 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     type ToolProductionError = IntegrationNotFoundError | StorageFailure;
     interface ToolProductionInFlight {
       readonly deferred: Deferred.Deferred<readonly Tool[], ToolProductionError>;
-      mode: "explicit" | "background";
+      readonly foreground?: Deferred.Deferred<void>;
+      mode: ToolProductionMode;
     }
     const toolProductionInFlight = new Map<string, ToolProductionInFlight>();
     const produceConnectionTools = (
       integrationRow: IntegrationRow,
       ref: ConnectionRef,
-      requestedMode: "explicit" | "background" = "explicit",
+      requestedMode: ToolProductionMode = "explicit",
     ): Effect.Effect<readonly Tool[], ToolProductionError> =>
       Effect.suspend(() => {
         const key = `${ref.owner}:${String(ref.integration)}:${String(ref.name)}`;
         const existing = toolProductionInFlight.get(key);
         if (existing) {
           if (requestedMode === "explicit") existing.mode = "explicit";
+          if (config.forkFeatures?.has("detached-catalog-refresh") && existing.foreground) {
+            return requestedMode === "detached"
+              ? Effect.succeed([])
+              : Deferred.succeed(existing.foreground, undefined).pipe(
+                  Effect.andThen(Deferred.await(existing.deferred)),
+                );
+          }
           return Deferred.await(existing.deferred);
         }
 
         const entry: ToolProductionInFlight = {
           deferred: Deferred.makeUnsafe<readonly Tool[], ToolProductionError>(),
           mode: requestedMode,
+          foreground: config.forkFeatures?.has("detached-catalog-refresh")
+            ? Deferred.makeUnsafe<void>()
+            : undefined,
         };
         toolProductionInFlight.set(key, entry);
-        const run = produceConnectionToolsUnshared(integrationRow, ref, () => entry.mode).pipe(
+        const run = produceConnectionToolsUnshared(
+          integrationRow,
+          ref,
+          () => entry.mode,
+          entry.foreground,
+        ).pipe(
           Effect.exit,
           Effect.flatMap((exit) => Deferred.done(entry.deferred, exit)),
           Effect.ensuring(Effect.sync(() => void toolProductionInFlight.delete(key))),
@@ -5578,6 +5682,50 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const toolsSyncTtlMs =
       config.toolsSyncTtlMs === undefined ? DEFAULT_TOOLS_SYNC_TTL_MS : config.toolsSyncTtlMs;
 
+    // A wave of remote discoveries can consume CPUs needed by catalog reads.
+    const detachedToolSyncLock = Semaphore.makeUnsafe(1);
+    const queuedToolSyncs = new Map<string, Deferred.Deferred<void>>();
+    const queueDetachedToolSync = (
+      connection: ConnectionRow,
+      ref: ConnectionRef,
+      rebuild: Effect.Effect<readonly Tool[]>,
+    ) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const key = `${ref.owner}:${String(ref.integration)}:${String(ref.name)}`;
+          const queued = queuedToolSyncs.get(key);
+          if (queued) return yield* restore(Deferred.await(queued));
+          const done = Deferred.makeUnsafe<void>();
+          queuedToolSyncs.set(key, done);
+          const run = detachedToolSyncLock.withPermits(1)(
+            Effect.gen(function* () {
+              // A scan can hold an old row after another refresh has finished.
+              // Explicit and urgent refreshes also bypass this queue.
+              const fresh = yield* findConnectionRow(ref);
+              if (fresh === null || fresh.tools_synced_at !== connection.tools_synced_at) return;
+              yield* rebuild;
+            }),
+          );
+          yield* Effect.forkDetach(
+            restore(run).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("executor detached tool sync failed", {
+                  integration: connection.integration,
+                  connection: connection.name,
+                  errorTag: Predicate.isTagged(error, "StorageError") ? "StorageError" : "Unknown",
+                }),
+              ),
+              Effect.ensuring(
+                Effect.sync(() => void queuedToolSyncs.delete(key)).pipe(
+                  Effect.andThen(Deferred.succeed(done, undefined)),
+                ),
+              ),
+            ),
+          );
+          yield* restore(Deferred.await(done));
+        }),
+      );
+
     // Rebuild any visible connection whose persisted tool catalog is stale.
     // Three triggers:
     //  - stale-marked: `tools_synced_at` is NULL (`connections.markToolsStale`
@@ -5653,7 +5801,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         // persisted rows at once. Without that split every read after the TTL
         // paid the grace budget for MCP listings it had no reason to wait on.
         const urgent: Effect.Effect<readonly Tool[]>[] = [];
-        const deferred: Effect.Effect<readonly Tool[]>[] = [];
+        const deferred: Effect.Effect<readonly Tool[] | void>[] = [];
         for (const connection of connections) {
           const integrationRow = integrationBySlug.get(connection.integration);
           if (!integrationRow) continue;
@@ -5679,6 +5827,41 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
             syncedAt !== null &&
             syncedAt < cutoff;
           if (!staleMarked && !configRevised && !expired) continue;
+
+          if (config.forkFeatures?.has("detached-catalog-refresh")) {
+            const ref: ConnectionRef = {
+              owner: connection.owner as Owner,
+              integration: IntegrationSlug.make(connection.integration),
+              name: ConnectionName.make(connection.name),
+            };
+            const detached =
+              mode !== "converge" && ((!staleMarked && !configRevised) || toolsSyncGraceMs === 0);
+            const rebuild = produceConnectionTools(
+              integrationRow,
+              ref,
+              detached ? "detached" : "background",
+            ).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("executor stale tool sync failed", {
+                  integration: connection.integration,
+                  connection: connection.name,
+                  errorTag: Predicate.isTagged(error, "StorageError") ? "StorageError" : "Unknown",
+                }).pipe(Effect.as([] as readonly Tool[])),
+              ),
+              Effect.withSpan("executor.tools.sync_stale", {
+                attributes: {
+                  "executor.integration": connection.integration,
+                  "executor.connection": connection.name,
+                },
+              }),
+            );
+            if (!detached) {
+              urgent.push(rebuild);
+            } else {
+              deferred.push(queueDetachedToolSync(connection, ref, rebuild));
+            }
+            continue;
+          }
 
           (staleMarked || configRevised || mode === "converge" ? urgent : deferred).push(
             produceConnectionTools(
@@ -5713,7 +5896,11 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }
         if (deferred.length > 0) {
           const background = yield* Effect.forkDetach(
-            Effect.all(deferred, { concurrency: STALE_TOOLS_SYNC_CONCURRENCY }),
+            Effect.all(deferred, {
+              concurrency: config.forkFeatures?.has("detached-catalog-refresh")
+                ? "unbounded"
+                : STALE_TOOLS_SYNC_CONCURRENCY,
+            }),
           );
           config.waitUntil?.(
             new Promise<void>((resolve) => background.addObserver(() => resolve(undefined))),
@@ -5881,7 +6068,9 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
           tools.push(tool);
         }
         return tools;
-      });
+      }).pipe((effect) =>
+        config.forkFeatures?.has("detached-catalog-refresh") ? withCatalogReader(effect) : effect,
+      );
 
     const toolsList = (filter?: ToolListFilter): Effect.Effect<readonly Tool[], StorageFailure> =>
       readTools(filter, { awaitStaleSync: true });
