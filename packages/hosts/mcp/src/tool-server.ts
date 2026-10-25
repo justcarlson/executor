@@ -73,6 +73,7 @@ import {
   type PausedExecution,
   type PausedExecutionDeadline,
 } from "@executor-js/execution";
+import { compactArguments, compactDescription, COMPACT_SEARCH_DETAIL } from "./fork-compact-search";
 import {
   MCP_APPS_SHELL_RESOURCE_URI,
   applyArtifactEdits,
@@ -1403,10 +1404,18 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
               ),
             limit: z.number().int().min(1).max(20).default(10),
             offset: z.number().int().min(0).default(0),
+            ...(forkFeatures?.has("compact-search")
+              ? {
+                  detail: z
+                    .enum(["compact", "full"])
+                    .default("compact")
+                    .describe(COMPACT_SEARCH_DETAIL),
+                }
+              : {}),
           },
           annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
         },
-        ({ query, integration, owner, connection, limit, offset }, extra) =>
+        ({ query, integration, owner, connection, limit, offset, detail }, extra) =>
           boundary(
             Effect.gen(function* () {
               const discovery = {
@@ -1445,8 +1454,18 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                       integration: identity.integration,
                       owner: identity.owner,
                       connection: identity.connection,
-                      description: match.description,
-                      inputSchema: passthroughInputSchema(schema),
+                      ...(forkFeatures?.has("compact-search") && detail !== "full"
+                        ? {
+                            description: compactDescription(match.description),
+                            arguments: compactArguments(
+                              schema.inputSchema,
+                              schema.schemaDefinitions,
+                            ),
+                          }
+                        : {
+                            description: match.description,
+                            inputSchema: passthroughInputSchema(schema),
+                          }),
                       ...(schema.annotations ? { annotations: schema.annotations } : {}),
                     };
                   }),
@@ -1514,7 +1533,9 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                   content: [
                     {
                       type: "text" as const,
-                      text: `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}`,
+                      text: forkFeatures?.has("compact-search")
+                        ? `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}. Expected inputSchema: ${JSON.stringify(passthroughInputSchema(schema))}`
+                        : `Invalid arguments for tool ${id}: ${checked.errorMessage ?? "invalid"}`,
                     },
                   ],
                 };
