@@ -1,3 +1,5 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
+import { searchAliasContext } from "./integration-aliases";
 import { Effect, Predicate } from "effect";
 import * as Cause from "effect/Cause";
 import type {
@@ -601,7 +603,11 @@ const matchesNamespace = (tool: SearchableTool, namespace?: string): boolean => 
   return isPrefixMatch(integrationTokens) || isPrefixMatch(pathTokens);
 };
 
-const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResult | null => {
+const scoreToolMatch = (
+  tool: SearchableTool,
+  query: string,
+  integrationAliases?: ReadonlyMap<string, string>,
+): ToolDiscoveryResult | null => {
   const normalizedQuery = normalizeSearchText(query);
   const queryTokens = tokenizeSearchText(query);
 
@@ -610,7 +616,8 @@ const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResul
   }
 
   const path = prepareField(tool.path);
-  const integration = prepareField(tool.integration);
+  const alias = integrationAliases?.get(tool.integration);
+  const integration = prepareField(alias ? `${tool.integration} ${alias}` : tool.integration);
   const name = prepareField(tool.name);
   const description = prepareField(tool.description);
 
@@ -672,10 +679,18 @@ const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResul
 
 /** What `tools.search()` calls inside the sandbox. */
 export const searchTools = Effect.fn("executor.tools.search")(function* (
-  executor: { readonly tools: Pick<Executor["tools"], "list"> },
+  executor: {
+    readonly tools: Pick<Executor["tools"], "list">;
+    readonly integrations?: Pick<Executor["integrations"], "list">;
+  },
   query: string,
   limit = 12,
-  options?: { readonly namespace?: string; readonly offset?: number },
+  options?: {
+    readonly namespace?: string;
+    readonly offset?: number;
+    readonly forkFeatures?: ForkFeatures;
+    readonly integrationAliases?: ReadonlyMap<string, string>;
+  },
 ) {
   const offset = options?.offset ?? 0;
   yield* Effect.annotateCurrentSpan({
@@ -701,6 +716,18 @@ export const searchTools = Effect.fn("executor.tools.search")(function* (
     } satisfies PagedResult<ToolDiscoveryResult>;
   }
 
+  const aliases =
+    options?.forkFeatures?.has("integration-aliases") && executor.integrations
+      ? yield* searchAliasContext(
+          executor.integrations,
+          hasNamespace ? options?.namespace?.trim() : undefined,
+        )
+      : undefined;
+  const namespace = aliases ? aliases.namespace : options?.namespace;
+  const integrationAliases = options?.forkFeatures?.has("integration-aliases")
+    ? (options.integrationAliases ?? aliases?.integrationAliases)
+    : undefined;
+
   const all = yield* executor.tools.list({ includeAnnotations: false }).pipe(
     Effect.mapError(
       (cause) =>
@@ -722,7 +749,7 @@ export const searchTools = Effect.fn("executor.tools.search")(function* (
   // `executor.integrations.list`'s per-integration toolCount.
   const ranked: readonly ToolDiscoveryResult[] = emptyQuery
     ? searchable
-        .filter((tool) => tool.integration === options?.namespace?.trim())
+        .filter((tool) => tool.integration === namespace?.trim())
         .sort((left, right) => left.path.localeCompare(right.path))
         .map((tool) => ({
           path: tool.path,
@@ -732,8 +759,8 @@ export const searchTools = Effect.fn("executor.tools.search")(function* (
           ...(tool.description !== undefined ? { description: tool.description } : {}),
         }))
     : searchable
-        .filter((tool: SearchableTool) => matchesNamespace(tool, options?.namespace))
-        .map((tool: SearchableTool) => scoreToolMatch(tool, query))
+        .filter((tool: SearchableTool) => matchesNamespace(tool, namespace))
+        .map((tool: SearchableTool) => scoreToolMatch(tool, query, integrationAliases))
         .filter(Predicate.isNotNull)
         .sort((left, right) => right.score - left.score || left.path.localeCompare(right.path));
 

@@ -21,6 +21,8 @@ import type { CodeExecutor, ExecuteResult, SandboxToolInvoker } from "@executor-
 
 import {
   defaultToolDiscoveryProvider,
+  searchTools,
+  type ToolDiscoveryInput,
   makeExecutorToolInvoker,
   listExecutorIntegrations,
   describeTool,
@@ -580,7 +582,19 @@ export type ExecutionEngine<E extends Cause.YieldableError = CodeExecutionError>
 export const createExecutionEngine = <E extends Cause.YieldableError = CodeExecutionError>(
   config: ExecutionEngineConfig<E>,
 ): ExecutionEngine<E> => {
-  const { executor, codeExecutor, toolDiscoveryProvider = defaultToolDiscoveryProvider } = config;
+  const { executor, codeExecutor } = config;
+  const toolDiscoveryProvider =
+    config.toolDiscoveryProvider ??
+    (config.forkFeatures?.has("integration-aliases")
+      ? {
+          searchTools: ({ executor, query, namespace, limit, offset }: ToolDiscoveryInput) =>
+            searchTools(executor, query, limit, {
+              namespace,
+              offset,
+              forkFeatures: config.forkFeatures,
+            }),
+        }
+      : defaultToolDiscoveryProvider);
   const pausedExecutions = new Map<string, InternalPausedExecution<E>>();
   // Every sandbox fiber `startPausableExecution` still has in flight.
   //

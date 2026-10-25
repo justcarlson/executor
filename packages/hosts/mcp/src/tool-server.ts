@@ -97,6 +97,9 @@ import {
 } from "./passthrough-tools";
 import type { McpToolMode } from "./browser-approval";
 
+import { selectIntegration } from "./fork-alias-selection";
+import { integrationAliasText } from "@executor-js/execution";
+
 // ---------------------------------------------------------------------------
 // Workers-compatible JSON Schema validator (replaces Ajv which uses new Function())
 // ---------------------------------------------------------------------------
@@ -1325,12 +1328,17 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                 integrations.list(),
               ]);
               const metadata = new Map(catalog.map((item) => [String(item.slug), item]));
+              const selected = forkFeatures?.has("integration-aliases")
+                ? selectIntegration(integration, catalog)
+                : undefined;
               const visible = accounts
                 .flatMap((account) => {
                   const item = metadata.get(account.integration);
                   if (
                     !item ||
-                    (integration !== undefined && account.integration !== integration) ||
+                    (selected
+                      ? selected.slugs !== null && !selected.slugs.has(account.integration)
+                      : integration !== undefined && account.integration !== integration) ||
                     (owner !== undefined && account.owner !== owner)
                   )
                     return [];
@@ -1366,6 +1374,7 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                 total: visible.length,
                 hasMore,
                 nextOffset: hasMore ? offset + items.length : null,
+                ...selected?.envelope,
               };
               return {
                 content: [{ type: "text" as const, text: JSON.stringify(result) }],
@@ -1418,24 +1427,45 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
         ({ query, integration, owner, connection, limit, offset, detail }, extra) =>
           boundary(
             Effect.gen(function* () {
+              const catalog = forkFeatures?.has("integration-aliases")
+                ? yield* integrations.list()
+                : [];
+              const selected = forkFeatures?.has("integration-aliases")
+                ? selectIntegration(integration, catalog)
+                : undefined;
+              const exactSlug = selected ? selected.exactSlug : integration;
               const discovery = {
                 tools: {
                   list: (filter?: Parameters<McpToolsPort["list"]>[0]) =>
                     tools
                       .list({
                         ...filter,
-                        ...(integration === undefined
+                        ...(exactSlug === undefined
                           ? {}
-                          : { integration: IntegrationSlug.make(integration) }),
+                          : { integration: IntegrationSlug.make(exactSlug) }),
                         ...(owner === undefined ? {} : { owner }),
                         ...(connection === undefined
                           ? {}
                           : { connection: ConnectionName.make(connection) }),
                       })
-                      .pipe(Effect.map((items) => items.filter((tool) => tool.static !== true))),
+                      .pipe(
+                        Effect.map((items) =>
+                          items.filter(
+                            (tool) =>
+                              tool.static !== true &&
+                              (!selected?.slugs || selected.slugs.has(tool.integration)),
+                          ),
+                        ),
+                      ),
                 },
               };
-              const page = yield* searchTools(discovery, query, limit, { offset });
+              const page = yield* searchTools(discovery, query, limit, {
+                offset,
+                forkFeatures,
+                ...(forkFeatures?.has("integration-aliases")
+                  ? { integrationAliases: integrationAliasText(catalog) }
+                  : {}),
+              });
               const candidates = yield* Effect.forEach(
                 page.items,
                 (match) =>
@@ -1471,7 +1501,11 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
                   }),
                 { concurrency: 4 },
               );
-              const result = { ...page, items: candidates.filter(Predicate.isNotNull) };
+              const result = {
+                ...page,
+                items: candidates.filter(Predicate.isNotNull),
+                ...selected?.envelope,
+              };
               return {
                 content: [{ type: "text" as const, text: JSON.stringify(result) }],
                 structuredContent: result,
