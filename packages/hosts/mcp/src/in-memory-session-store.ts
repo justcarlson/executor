@@ -1,3 +1,4 @@
+import { withStandaloneStreamKeepalive } from "./fork-standalone-stream";
 import type { ForkFeatures } from "@executor-js/sdk/core";
 import { Cause, Data, Effect, Layer } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -253,6 +254,9 @@ export const makeInMemoryMcpSessionStore = (
   const engines = new Map<string, ExecutionEngine<Cause.YieldableError>>();
   const executors = new Map<string, Executor>();
   const closers = new Map<string, () => Promise<void>>();
+  const sessionAborts = options.forkFeatures?.has("standalone-sse-keepalive")
+    ? new Map<string, AbortController>()
+    : undefined;
   const approvals: InProcessBrowserApprovalStore = makeInProcessBrowserApprovalStore();
   // Monotonic-ish last-touch stamp per live session, the first input the idle
   // sweep reads. Written on create and on every forwarded request.
@@ -323,6 +327,8 @@ export const makeInMemoryMcpSessionStore = (
     engines.delete(id);
     executors.delete(id);
     closers.delete(id);
+    sessionAborts?.get(id)?.abort();
+    sessionAborts?.delete(id);
     lastSeen.delete(id);
     activeRequests.delete(id);
     if (opts.transport)
@@ -394,6 +400,7 @@ export const makeInMemoryMcpSessionStore = (
   ): Effect.Effect<McpDispatchResult> => {
     const transport = transports.get(sessionId);
     const owner = owners.get(sessionId);
+    const sessionAbort = sessionAborts?.get(sessionId);
     if (!transport || !owner) return Effect.succeed("not-found");
     if (!sessionOwnerMatches(owner, principal, resource)) return Effect.succeed("forbidden");
     owners.set(sessionId, { principal, resource });
@@ -404,6 +411,11 @@ export const makeInMemoryMcpSessionStore = (
     // make the session immortal, the opposite leak).
     beginRequest(sessionId);
     return runHandleRequest(transport, request, orgWriteAccessForPrincipal(principal)).pipe(
+      Effect.map((response) =>
+        request.method === "GET" && sessionAbort
+          ? withStandaloneStreamKeepalive(response, sessionAbort.signal)
+          : response,
+      ),
       Effect.ensuring(Effect.sync(() => endRequest(sessionId))),
     );
   };
@@ -471,6 +483,7 @@ export const makeInMemoryMcpSessionStore = (
               engines.set(sid, engine);
               if (executor) executors.set(sid, executor);
               if (close) closers.set(sid, close);
+              sessionAborts?.set(sid, new AbortController());
               lastSeen.set(sid, Date.now());
             },
             onsessionclosed: (sid) => void dispose(sid, { server: true }),
