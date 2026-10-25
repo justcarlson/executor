@@ -1,3 +1,4 @@
+import { pluginKey } from "./fork-key-cache";
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "node:crypto";
 
 import { Effect } from "effect";
@@ -130,6 +131,7 @@ export interface EncryptedSecretsPluginConfig {
    * is unsafe, so this is required.
    */
   readonly key: string;
+  readonly reuseDerivedKey?: boolean;
 }
 
 export const encryptedSecretsPlugin = definePlugin((options?: EncryptedSecretsPluginConfig) => {
@@ -138,7 +140,7 @@ export const encryptedSecretsPlugin = definePlugin((options?: EncryptedSecretsPl
     // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: a secret store with no master key is unsafe; fail loud at construction
     throw new Error("encryptedSecretsPlugin requires a non-empty `key`");
   }
-  const derivedKey = deriveKey(master);
+  const derivedKey = options?.reuseDerivedKey ? pluginKey(master, deriveKey) : deriveKey(master);
   return {
     id: "encryptedSecrets" as const,
     storage: () => ({}),
