@@ -85,6 +85,7 @@ export interface EngineDecoratorShape {
  * side channel.
  */
 export interface EngineStackContext {
+  readonly executor: Executor;
   readonly mcpResource?: McpResource;
 }
 
@@ -148,7 +149,7 @@ export const makeExecutionStack = <
           organizationId,
           organizationName,
         },
-        { mcpResource: options?.mcpResource },
+        { mcpResource: options?.mcpResource, executor },
       ),
     );
     return { executor, engine };

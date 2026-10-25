@@ -39,3 +39,5 @@ export {
   type PagedResult,
   type ToolDiscoveryResult,
 } from "./tool-invoker";
+
+export { buildForkExecuteDescription } from "./fork-inventory";

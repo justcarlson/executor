@@ -76,7 +76,7 @@ const INVENTORY_LIMIT = 50;
 
 /** One inventory line per integration: `` - `slug` ``. Owned here beside the
  *  formatter below so {@link parseIntegrationInventory} cannot drift from it. */
-const INVENTORY_ITEM_PATTERN = /^- `([^`]+)`$/;
+const INVENTORY_ITEM_PATTERN = /^- `([^`]+)`(?: — .*)?$/;
 
 /**
  * Recover the integration slugs from a built execute description — the exact
