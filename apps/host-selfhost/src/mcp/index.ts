@@ -1,3 +1,4 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Effect, Layer } from "effect";
 
 import { IdentityProvider } from "@executor-js/api/server";
@@ -153,6 +154,7 @@ export const makeSelfHostMcpSeams = (
   dbHandle: SelfHostDbHandle,
   betterAuth: BetterAuthHandle,
   config: SelfHostConfig,
+  forkFeatures: ForkFeatures = forkFeaturesOff,
 ): SelfHostMcpSeams => {
   // The pinned public origin keeps browser-approval URLs reachable behind a
   // reverse proxy (not the internal 127.0.0.1 bind from the request URL).
@@ -160,6 +162,7 @@ export const makeSelfHostMcpSeams = (
     dbHandle,
     config.webBaseUrl,
     config.mcpSessionIdleTtlMs,
+    forkFeatures,
   );
   const auth: Layer.Layer<McpAuthProvider, never, IdentityProvider> = selfHostMcpAuth.pipe(
     Layer.provide(Layer.succeed(BetterAuth)(betterAuth)),

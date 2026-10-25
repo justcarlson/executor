@@ -1,0 +1,31 @@
+{
+  "upstreamCommit": "4c753d3b1c4a5c4c9d926f718c02c0622635f2f6",
+  "available": [
+    "inventory-descriptions",
+    "automatic-attachments",
+    "catalog-read-fastpath",
+    "compact-search",
+    "integration-aliases",
+    "lean-guidance",
+    "secret-key-cache",
+    "tool-usage",
+    "lazy-execute-description",
+    "current-membership",
+    "standalone-sse-keepalive",
+    "detached-catalog-refresh"
+  ],
+  "production": [
+    "inventory-descriptions",
+    "automatic-attachments",
+    "catalog-read-fastpath",
+    "compact-search",
+    "integration-aliases",
+    "lean-guidance",
+    "secret-key-cache",
+    "tool-usage",
+    "lazy-execute-description",
+    "current-membership",
+    "standalone-sse-keepalive",
+    "detached-catalog-refresh"
+  ]
+}

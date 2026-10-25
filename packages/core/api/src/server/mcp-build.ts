@@ -57,7 +57,12 @@ export const makeMcpBuildServer =
       // hosts that can't know their public URL at boot leave it unset — in
       // which case artifacts still persist but carry no deep link.
       const hostConfig = yield* HostConfig;
-      return { engine, executor, webBaseUrl: hostConfig.webBaseUrl };
+      return {
+        engine,
+        executor,
+        webBaseUrl: hostConfig.webBaseUrl,
+        forkFeatures: hostConfig.forkFeatures,
+      };
     }).pipe(
       // Pin browser-handoff URLs to the principal's org slug when present;
       // absent slug leaves the service unprovided and the URL stays bare.
@@ -66,8 +71,9 @@ export const makeMcpBuildServer =
         : (effect) => effect,
       Effect.provide(executionStack),
       Effect.mapError((cause) => new McpEngineBuildError({ cause })),
-      Effect.flatMap(({ engine, executor, webBaseUrl }) =>
+      Effect.flatMap(({ engine, executor, webBaseUrl, forkFeatures }) =>
         createExecutorMcpServer({
+          forkFeatures,
           engine,
           artifacts: executor.artifacts,
           connections: executor.connections,

@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
 import { Deferred, Effect, Fiber, Predicate, Queue, Ref } from "effect";
 import type * as Cause from "effect/Cause";
 import * as Exit from "effect/Exit";
@@ -33,6 +34,7 @@ import { buildExecuteDescription } from "./description";
 // ---------------------------------------------------------------------------
 
 export type ExecutionEngineConfig<E extends Cause.YieldableError = CodeExecutionError> = {
+  readonly forkFeatures?: ForkFeatures;
   readonly executor: Executor;
   readonly codeExecutor: CodeExecutor<E>;
   readonly toolDiscoveryProvider?: ToolDiscoveryProvider;

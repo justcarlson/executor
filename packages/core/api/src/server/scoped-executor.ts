@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
 // ---------------------------------------------------------------------------
 // Shared scoped-executor factory + the host seams it reads from.
 //
@@ -58,6 +59,7 @@ import { RequestBackgroundTasks } from "./request-scoped";
 // ---------------------------------------------------------------------------
 
 export interface HostConfigShape {
+  readonly forkFeatures?: ForkFeatures;
   /**
    * Whether the hosted HTTP client may dial private/loopback addresses. Each
    * host reads it from config (`EXECUTOR_ALLOW_LOCAL_NETWORK` / `ALLOW_LOCAL_NETWORK`);
@@ -325,6 +327,7 @@ export const makeScopedExecutor = <
     // subject (drives `owner: "user"` rows). `organizationName` is no longer part
     // of the executor binding — it stays on `AuthContext` for display.
     const executor = yield* createExecutor({
+      forkFeatures: config.forkFeatures,
       tenant: Tenant.make(organizationId),
       subject: Subject.make(accountId),
       db,
@@ -422,6 +425,7 @@ export const makePlatformExecutor = (
     };
 
     return yield* createExecutor({
+      forkFeatures: config.forkFeatures,
       tenant: Tenant.make(organizationId),
       db,
       blobs,

@@ -1,3 +1,6 @@
+import { mcpGuidanceRegistrar } from "./fork-guidance-registration";
+import { mcpGuidanceSkill, mcpGuidanceInstructions } from "./fork-guidance";
+import type { ForkFeatures } from "@executor-js/sdk/core";
 import { reattachDefs } from "@executor-js/sdk/host-internal";
 import { Data, Duration, Effect, Match, Option, Predicate, Result, Schema } from "effect";
 import * as Cause from "effect/Cause";
@@ -116,6 +119,7 @@ class CfWorkerJsonSchemaValidator implements jsonSchemaValidator {
 // ---------------------------------------------------------------------------
 
 type SharedMcpServerConfig = {
+  readonly forkFeatures?: ForkFeatures;
   /**
    * Pre-built `execute` tool description. When provided, the factory skips
    * its internal `engine.getDescription` yield. Useful when the caller
@@ -1263,7 +1267,7 @@ const passthroughInputSchema = (view: ToolSchemaView): unknown =>
 
 /** Register discovery over the existing APIs, with no catalog work at connection time. */
 const registerPassthroughTools = <E extends Cause.YieldableError>(
-  server: McpServer,
+  server: Pick<McpServer, "registerTool">,
   tools: McpToolsPort,
   connections: McpConnectionsPort,
   integrations: McpIntegrationsPort,
@@ -1272,6 +1276,7 @@ const registerPassthroughTools = <E extends Cause.YieldableError>(
     args: unknown,
     extra: McpRequestJoinKeys,
   ) => Effect.Effect<McpToolResult, E>,
+  forkFeatures?: ForkFeatures,
 ): Effect.Effect<void> =>
   Effect.gen(function* () {
     const context = yield* Effect.context<never>();
@@ -1531,13 +1536,14 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
     const skillCatalog: readonly Skill[] =
       config.mode === "passthrough"
         ? [
-            SEARCH_INVOKE_SKILL,
+            mcpGuidanceSkill(config.forkFeatures, SEARCH_INVOKE_SKILL),
             ...skillCatalogFor({
               artifacts: artifactsEnabled && config.loadAppShellHtml !== undefined,
               discovery: "search-invoke",
+              forkFeatures: config.forkFeatures,
             }),
           ]
-        : skillCatalogFor({ artifacts: artifactsEnabled });
+        : skillCatalogFor({ artifacts: artifactsEnabled, forkFeatures: config.forkFeatures });
     // Per-integration search tools are off unless this connection opted in
     // (`?search_tools=true`).
     const searchToolsEnabled = config.searchToolsEnabled ?? false;
@@ -1653,11 +1659,11 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
             // per host.
             capabilities: { resources: {}, tools: {} },
             jsonSchemaValidator: new CfWorkerJsonSchemaValidator(),
-            ...(passthrough
-              ? {
-                  instructions: passthroughInstructions(),
-                }
-              : {}),
+            ...mcpGuidanceInstructions(
+              mode,
+              passthrough ? passthroughInstructions() : undefined,
+              config.forkFeatures,
+            ),
           },
         ),
     ).pipe(Effect.withSpan("mcp.host.create_server"));
@@ -2038,11 +2044,12 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
     // Passthrough serves search and invoke in place of the codemode tools.
     if (passthrough && config.tools && config.connections && config.integrations) {
       yield* registerPassthroughTools(
-        server,
+        mcpGuidanceRegistrar(server, mode, config.forkFeatures),
         config.tools,
         config.connections,
         config.integrations,
         executePassthroughCall,
+        config.forkFeatures,
       );
     }
 
@@ -2063,7 +2070,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       );
 
     yield* Effect.sync(() =>
-      server.registerTool(
+      mcpGuidanceRegistrar(server, mode, config.forkFeatures).registerTool(
         "skills",
         {
           annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },

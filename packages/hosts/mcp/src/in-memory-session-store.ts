@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
 import { Cause, Data, Effect, Layer } from "effect";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -238,6 +239,7 @@ export const makeInMemoryMcpSessionStore = (
   // internal bind address (127.0.0.1:PORT), unreachable for the user. Omit it on
   // loopback hosts (local/desktop), where the request URL is already correct.
   options: {
+    readonly forkFeatures?: ForkFeatures;
     readonly webBaseUrl?: string;
     /** Idle window before a session is evicted. 0 disables eviction. */
     readonly sessionIdleTtlMs?: number;

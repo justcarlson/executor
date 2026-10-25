@@ -139,9 +139,10 @@ export const makeExecutionStack = <
     const { decorate } = yield* EngineDecorator.asEffect().pipe(
       Effect.withSpan("executor.stack.decorator"),
     );
+    const { forkFeatures } = yield* HostConfig;
     const engine = yield* Effect.sync(() =>
       decorate(
-        createExecutionEngine({ executor, codeExecutor }),
+        createExecutionEngine({ executor, codeExecutor, forkFeatures }),
         {
           accountId,
           organizationId,

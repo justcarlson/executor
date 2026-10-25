@@ -13,6 +13,9 @@
  * genuinely needs its own how-to behind the same `skills` door.
  */
 
+import type { ForkFeatures } from "@executor-js/sdk/core";
+import { forkSkillCatalog } from "./fork-skill-guidance";
+
 export interface Skill {
   /** Stable identifier the model passes to the `skills` tool. */
   readonly name: string;
@@ -651,6 +654,7 @@ const ARTIFACT_SKILLS: ReadonlySet<Skill> = new Set([CREATE_ARTIFACT_SKILL, ARTI
  * does not have; a session that opted in gets the full {@link SKILLS} list.
  */
 export const skillCatalogFor = (options: {
+  readonly forkFeatures?: ForkFeatures;
   readonly artifacts: boolean;
   readonly discovery?: "execute" | "search-invoke";
 }): readonly Skill[] => {
@@ -667,7 +671,10 @@ export const skillCatalogFor = (options: {
         ]
       : [];
   }
-  return options.artifacts ? SKILLS : SKILLS.filter((skill) => !ARTIFACT_SKILLS.has(skill));
+  return forkSkillCatalog(
+    options.artifacts ? SKILLS : SKILLS.filter((skill) => !ARTIFACT_SKILLS.has(skill)),
+    options.forkFeatures,
+  );
 };
 
 /** Look up a skill by its exact name within a session's catalog. */

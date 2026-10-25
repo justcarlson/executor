@@ -1,3 +1,4 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Layer } from "effect";
 
 import { makeConsoleMcpErrorReporter, makeMcpBuildServer } from "@executor-js/api/server";
@@ -11,7 +12,7 @@ import {
 import { selfHostAnalytics } from "../analytics";
 import { ErrorCaptureLive } from "../observability";
 import { SelfHostDb, type SelfHostDbHandle } from "../db/self-host-db";
-import { SelfHostExecutionStackLayer } from "../execution";
+import { makeSelfHostExecutionStackLayer } from "../fork-execution";
 
 // ---------------------------------------------------------------------------
 // Self-host McpSessionStore wiring. The store body (Maps, dispatch, ownership,
@@ -37,10 +38,13 @@ export const makeSelfHostMcpSessionStore = (
   db: SelfHostDbHandle,
   webBaseUrl?: string,
   sessionIdleTtlMs?: number,
+  forkFeatures: ForkFeatures = forkFeaturesOff,
 ): InMemoryMcpSessionStore =>
   makeInMemoryMcpSessionStore(
     makeMcpBuildServer(
-      SelfHostExecutionStackLayer.pipe(Layer.provide(Layer.succeed(SelfHostDb)(db))),
+      makeSelfHostExecutionStackLayer(forkFeatures).pipe(
+        Layer.provide(Layer.succeed(SelfHostDb)(db)),
+      ),
       {
         loadAppShellHtml: loadMcpAppsShellHtml,
         smokeRenderArtifact,
@@ -50,6 +54,7 @@ export const makeSelfHostMcpSessionStore = (
       },
     ),
     {
+      forkFeatures,
       ...(webBaseUrl === undefined ? {} : { webBaseUrl }),
       ...(sessionIdleTtlMs === undefined ? {} : { sessionIdleTtlMs }),
     },

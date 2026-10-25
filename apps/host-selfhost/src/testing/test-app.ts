@@ -1,3 +1,4 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { HttpApiSwagger } from "effect/unstable/httpapi";
 import { Effect, Layer } from "effect";
 
@@ -21,10 +22,11 @@ import {
 
 import { createSelfHostDb, SelfHostDb, SelfHostDbProvider } from "../db/self-host-db";
 import {
-  SelfHostCodeExecutorProvider,
-  SelfHostHostConfig,
-  SelfHostPluginsProvider,
-} from "../execution";
+  makeSelfHostCodeExecutorProvider,
+  makeSelfHostEngineDecorator,
+  makeSelfHostHostConfig,
+  makeSelfHostPluginsProvider,
+} from "../fork-execution";
 import executorConfig from "../../executor.config";
 import { loadConfig, SELF_HOST_NAMESPACE, SELF_HOST_SCHEMA_VERSION } from "../config";
 import {
@@ -189,6 +191,7 @@ const stubMcpAuth: Layer.Layer<McpAuthProvider, never, IdentityProvider> = Layer
 // ---------------------------------------------------------------------------
 
 export interface MakeSelfHostTestAppOptions {
+  readonly forkFeatures?: ForkFeatures;
   /** The test `IdentityProvider` (single-admin / header-driven). */
   readonly identity: Layer.Layer<IdentityProvider>;
   /** Override the SQLite path (defaults to the config data dir). */
@@ -206,6 +209,7 @@ export interface SelfHostTestHandler {
 export const makeSelfHostTestApp = async (
   options: MakeSelfHostTestAppOptions,
 ): Promise<SelfHostTestHandler> => {
+  const forkFeatures = options.forkFeatures ?? forkFeaturesOff;
   const config = loadConfig();
 
   const dbHandle = await createSelfHostDb({
@@ -214,12 +218,13 @@ export const makeSelfHostTestApp = async (
     version: SELF_HOST_SCHEMA_VERSION,
   });
 
-  const sessionStore = makeSelfHostMcpSessionStore(dbHandle);
+  const sessionStore = makeSelfHostMcpSessionStore(dbHandle, undefined, undefined, forkFeatures);
   const pluginsProvider = options.pluginDeps
     ? Layer.succeed(PluginsProvider)({
         plugins: (context) =>
           executorConfig.plugins({
             ...options.pluginDeps,
+            forkFeatures,
             activeToolkitSlug:
               context?.mcpResource?.kind === "toolkit"
                 ? context.mcpResource.slug
@@ -229,20 +234,23 @@ export const makeSelfHostTestApp = async (
               process.env.EXECUTOR_ALLOW_LOCAL_NETWORK === "true",
           }),
       })
-    : SelfHostPluginsProvider;
+    : makeSelfHostPluginsProvider(forkFeatures);
 
   const { toWebHandler } = ExecutorApp.make({
     plugins: selfHostPlugins,
     providers: {
       identity: options.identity,
       db: SelfHostDbProvider,
-      engine: { codeExecutor: SelfHostCodeExecutorProvider },
+      engine: {
+        codeExecutor: makeSelfHostCodeExecutorProvider(forkFeatures),
+        decorator: makeSelfHostEngineDecorator(forkFeatures),
+      },
       mcp: {
         auth: stubMcpAuth,
         sessions: selfHostMcpSessions(sessionStore),
         reporter: selfHostMcpReporter,
       },
-      plugins: { provider: pluginsProvider, config: SelfHostHostConfig },
+      plugins: { provider: pluginsProvider, config: makeSelfHostHostConfig(forkFeatures) },
       errorCapture: ErrorCaptureLive,
     },
     extensions: {
@@ -254,7 +262,11 @@ export const makeSelfHostTestApp = async (
     // The test identity is boot-scoped exactly as production's is: no
     // requestScoped layer, so the execution middleware leaves IdentityProvider
     // residual and `provideMerge(boot)` supplies it.
-    boot: Layer.merge(Layer.succeed(SelfHostDb)(dbHandle), options.identity),
+    boot: Layer.mergeAll(
+      Layer.succeed(SelfHostDb)(dbHandle),
+      options.identity,
+      makeSelfHostHostConfig(forkFeatures),
+    ),
   });
 
   const web = toWebHandler();

@@ -1,3 +1,6 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
+import { loadForkConfig } from "./fork-config";
+import executorConfig from "../executor.config";
 import { HttpApiSwagger } from "effect/unstable/httpapi";
 import { HttpEffect, HttpRouter } from "effect/unstable/http";
 import { Effect, Layer } from "effect";
@@ -19,14 +22,14 @@ import { makeSelfHostSystemApiLayer } from "./system/handlers";
 import { selfHostAccountMiddleware } from "./account";
 import { loadConfig, SELF_HOST_NAMESPACE, SELF_HOST_SCHEMA_VERSION } from "./config";
 import { createSelfHostDb, SelfHostDb, SelfHostDbProvider } from "./db/self-host-db";
-import { selfHostAnalytics, SelfHostAnalyticsEngineDecorator } from "./analytics";
+import { selfHostAnalytics } from "./analytics";
 import {
-  SelfHostCodeExecutorProvider,
-  SelfHostHostConfig,
-  SelfHostPluginsProvider,
-} from "./execution";
+  makeSelfHostCodeExecutorProvider,
+  makeSelfHostEngineDecorator,
+  makeSelfHostHostConfig,
+  makeSelfHostPluginsProvider,
+} from "./fork-execution";
 import { makeSelfHostMcpSeams } from "./mcp";
-import { selfHostPlugins } from "./plugins";
 import { ErrorCaptureLive } from "./observability";
 import { oauthCallbackSignInRedirectLocation } from "./auth/oauth-callback-login";
 
@@ -51,11 +54,14 @@ import { oauthCallbackSignInRedirectLocation } from "./auth/oauth-callback-login
 // ===========================================================================
 
 export interface MakeSelfHostAppOptions {
+  readonly forkFeatures?: ForkFeatures;
   /** Override the SQLite path (tests point at a throwaway file). */
   readonly dbPath?: string;
 }
 
 export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
+  const forkFeatures = options.forkFeatures ?? (await Effect.runPromise(loadForkConfig()));
+  const selfHostPlugins = executorConfig.plugins({ forkFeatures });
   const config = loadConfig();
 
   // ---- eager async boot: the shared libSQL handle -----------------------
@@ -77,7 +83,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     await resolveAuthProviders(dbHandle);
 
   // ---- the in-process MCP serving seams (+ shutdown hook) ----------------
-  const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config);
+  const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config, forkFeatures);
 
   // CLI device-login discovery (`executor login`). Points the CLI at Better
   // Auth's device endpoints; `requestFormat: "json"` because those endpoints
@@ -104,13 +110,16 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
       account: selfHostAccountMiddleware(betterAuth),
       db: SelfHostDbProvider,
       engine: {
-        codeExecutor: SelfHostCodeExecutorProvider,
+        codeExecutor: makeSelfHostCodeExecutorProvider(forkFeatures),
         // Anonymous execution analytics (this seam is the HTTP plane; the MCP
         // plane's decorator is wired in mcp/session-store.ts's stack layer).
-        decorator: SelfHostAnalyticsEngineDecorator,
+        decorator: makeSelfHostEngineDecorator(forkFeatures),
       },
       mcp: { auth: mcp.auth, sessions: mcp.sessions, reporter: mcp.reporter },
-      plugins: { provider: SelfHostPluginsProvider, config: SelfHostHostConfig },
+      plugins: {
+        provider: makeSelfHostPluginsProvider(forkFeatures),
+        config: makeSelfHostHostConfig(forkFeatures),
+      },
       errorCapture: ErrorCaptureLive,
     },
     extensions: {
@@ -153,6 +162,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     // layer, so operations it serves file as `via: "ui"`).
     boot: Layer.mergeAll(
       Layer.succeed(SelfHostDb)(dbHandle),
+      makeSelfHostHostConfig(forkFeatures),
       identityLayer,
       memberDirectoryLayer,
       Layer.succeed(ArtifactUsageObserver)((action) =>

@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "./fork-features";
 import {
   Cause,
   Deferred,
@@ -702,6 +703,7 @@ export type ExecutorDbFactory = (config: {
 }) => ExecutorDbInput | Effect.Effect<ExecutorDbInput, StorageFailure>;
 
 export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly []> {
+  readonly forkFeatures?: ForkFeatures;
   /** The org / workspace this executor is bound to. `owner: "org"` rows file
    *  here. */
   readonly tenant: Tenant;

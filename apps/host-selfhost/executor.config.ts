@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
 import { defineExecutorConfig } from "@executor-js/sdk";
 import { openApiHttpPlugin } from "@executor-js/plugin-openapi/api";
 import {
@@ -26,6 +27,7 @@ import { resolveSecretKey } from "./src/config";
 // ---------------------------------------------------------------------------
 
 interface SelfHostPluginDeps {
+  readonly forkFeatures?: ForkFeatures;
   readonly activeToolkitSlug?: string;
   /** Accepted for test-harness parity; the Microsoft Graph URL override moved
    *  into the OpenAPI provider presets, so the factory no longer reads it. */

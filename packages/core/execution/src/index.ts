@@ -1,3 +1,4 @@
+export { withForkCodeExecutor } from "./fork-code-executor";
 export {
   createExecutionEngine,
   formatExecuteResult,
