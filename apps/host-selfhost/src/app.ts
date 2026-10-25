@@ -80,7 +80,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
   // Better Auth: cookie/bearer/api-key identity + /api/auth handler + account
   // API + MCP OAuth seam, all over the shared libSQL handle.
   const { identityLayer, memberDirectoryLayer, authHandler, betterAuth } =
-    await resolveAuthProviders(dbHandle);
+    await resolveAuthProviders(dbHandle, forkFeatures);
 
   // ---- the in-process MCP serving seams (+ shutdown hook) ----------------
   const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config, forkFeatures);
@@ -107,7 +107,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
     plugins: selfHostPlugins,
     providers: {
       identity: identityLayer,
-      account: selfHostAccountMiddleware(betterAuth),
+      account: selfHostAccountMiddleware(betterAuth, forkFeatures),
       db: SelfHostDbProvider,
       engine: {
         codeExecutor: makeSelfHostCodeExecutorProvider(forkFeatures),
@@ -152,7 +152,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
         HttpApiSwagger.layer(composePluginApi(selfHostPlugins).prefix("/api"), { path: "/docs" }),
       ],
     },
-    config: { mountPrefix: "/api", failure: textFailureStrategy },
+    config: { mountPrefix: "/api", failure: textFailureStrategy, forkFeatures },
     // The boot-scoped context provideMerge'd under everything: the long-lived DB
     // handle (read by the DbProvider seam, Better Auth, and the MCP store) + the
     // resolved identity (captured once by the execution middleware + MCP auth)

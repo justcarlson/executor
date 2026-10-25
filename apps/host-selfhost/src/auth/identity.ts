@@ -1,3 +1,5 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
+import { requireInstanceMembership } from "./membership";
 import { Effect, Layer } from "effect";
 
 import { IdentityProvider, Unauthorized } from "@executor-js/api/server";
@@ -62,7 +64,9 @@ export const resolveSelfHostOrgRole = (
 // Single-org instance, so organizationName is the boot-cached org name.
 // ---------------------------------------------------------------------------
 
-export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, BetterAuth> =
+export const makeBetterAuthIdentityLayer = (
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+): Layer.Layer<IdentityProvider, never, BetterAuth> =>
   Layer.effect(IdentityProvider)(
     Effect.gen(function* () {
       const betterAuth = yield* BetterAuth;
@@ -100,11 +104,9 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
             // `organizationId` query keeps a caller-controlled active org from
             // answering for an org they own elsewhere. FAIL CLOSED to "member"
             // — an infra fault demotes rather than escalates.
-            const orgRole = yield* resolveSelfHostOrgRole(
-              betterAuth,
-              sessionHeaders,
-              resolvedOrganizationId,
-            );
+            const orgRole = yield* forkFeatures.has("current-membership")
+              ? requireInstanceMembership(betterAuth, resolved.user.id, resolvedOrganizationId)
+              : resolveSelfHostOrgRole(betterAuth, sessionHeaders, resolvedOrganizationId);
             return {
               kind: "member" as const,
               accountId: resolved.user.id,
@@ -125,3 +127,5 @@ export const betterAuthIdentityLayer: Layer.Layer<IdentityProvider, never, Bette
       });
     }),
   );
+
+export const betterAuthIdentityLayer = makeBetterAuthIdentityLayer();

@@ -1,3 +1,5 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
+import { findInstanceMembership, type MembershipLookupFailed } from "../auth/membership";
 import { Effect, Layer } from "effect";
 import { oAuthDiscoveryMetadata, oAuthProtectedResourceMetadata } from "better-auth/plugins";
 
@@ -6,6 +8,7 @@ import {
   authenticated,
   McpAuthProvider,
   unauthorized,
+  unavailable,
   type AuthOutcome,
   type McpDiscoveryRoute,
   type Principal,
@@ -153,11 +156,14 @@ const toolkitProtectedResourceMetadata = (
   });
 };
 
-export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | IdentityProvider> =
+export const makeSelfHostMcpAuth = (
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+): Layer.Layer<McpAuthProvider, never, BetterAuth | IdentityProvider> =>
   Layer.effect(
     McpAuthProvider,
     Effect.gen(function* () {
-      const { auth, organizationId, organizationName, organizationSlug } = yield* BetterAuth;
+      const betterAuth = yield* BetterAuth;
+      const { auth, organizationId, organizationName, organizationSlug } = betterAuth;
       const fallback = yield* IdentityProvider;
 
       const asMetadata = oAuthDiscoveryMetadata(auth);
@@ -202,7 +208,9 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
       const context = yield* Effect.promise(() => auth.$context);
 
       /** Enrich a bare OAuth `userId` into the full provider-neutral principal. */
-      const principalFromUserId = (userId: string): Effect.Effect<Principal | null> =>
+      const principalFromUserId = (
+        userId: string,
+      ): Effect.Effect<Principal | null, MembershipLookupFailed> =>
         Effect.gen(function* () {
           const user = yield* Effect.promise(() => context.internalAdapter.findUserById(userId));
           if (!user) return null;
@@ -211,15 +219,18 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
           // `getActiveMemberRole` gate is out of reach — the adapter query
           // answers the same question against the same table). FAIL CLOSED to
           // "member": an infra fault demotes rather than escalates.
-          const membership = yield* Effect.promise(() =>
-            context.adapter.findOne<{ readonly role?: string | null }>({
-              model: "member",
-              where: [
-                { field: "userId", value: userId },
-                { field: "organizationId", value: organizationId },
-              ],
-            }),
-          ).pipe(Effect.orElseSucceed(() => null));
+          const membership = yield* forkFeatures.has("current-membership")
+            ? findInstanceMembership(betterAuth, userId, organizationId)
+            : Effect.promise(() =>
+                context.adapter.findOne<{ readonly role?: string | null }>({
+                  model: "member",
+                  where: [
+                    { field: "userId", value: userId },
+                    { field: "organizationId", value: organizationId },
+                  ],
+                }),
+              ).pipe(Effect.orElseSucceed(() => null));
+          if (forkFeatures.has("current-membership") && !membership) return null;
           const orgRole =
             membership?.role != null && isPrivileged(membership.role)
               ? ("admin" as const)
@@ -241,8 +252,10 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
         });
 
       /** (a) The mcp() OAuth opaque bearer, with self-enforced expiry. */
-      const authenticateOAuthBearer = (request: Request): Effect.Effect<Principal | null> =>
-        Effect.gen(function* () {
+      const authenticateOAuthBearer = (
+        request: Request,
+      ): Effect.Effect<Principal | null, MembershipLookupFailed> => {
+        const authentication = Effect.gen(function* () {
           const session = yield* Effect.promise(() =>
             auth.api.getMcpSession({ headers: request.headers }),
           );
@@ -251,14 +264,18 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
           // expired token still resolves. Reject it here.
           if (new Date(session.accessTokenExpiresAt).getTime() < Date.now()) return null;
           return yield* principalFromUserId(session.userId);
-        }).pipe(Effect.orElseSucceed(() => null));
+        });
+        return forkFeatures.has("current-membership")
+          ? authentication
+          : authentication.pipe(Effect.orElseSucceed(() => null));
+      };
 
       /** (b) The existing cookie / bearer-session / x-api-key path. The fallback's
        * api `Principal` shape is byte-identical to host-mcp's `Principal`. The
        * neutral seam can also resolve a platform credential, which self-host's
        * identity never produces — narrowed away rather than asserted, so an MCP
        * session can never bind to a subject-less credential if that changes. */
-      const authenticateSession = (request: Request): Effect.Effect<Principal | null> =>
+      const authenticateSession = (request: Request) =>
         fallback.authenticate(request).pipe(
           Effect.map((principal) => (isPlatformPrincipal(principal) ? null : principal)),
           Effect.catchTags({
@@ -286,6 +303,11 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
           Effect.map((principal) =>
             principal ? authenticated(principal) : unauthorized(challengeFor(request)),
           ),
+          Effect.catchTags({
+            MembershipLookupFailed: () =>
+              Effect.succeed(unavailable("Membership lookup unavailable")),
+            Unavailable: () => Effect.succeed(unavailable("Membership lookup unavailable")),
+          }),
         );
 
       return {
@@ -295,3 +317,5 @@ export const selfHostMcpAuth: Layer.Layer<McpAuthProvider, never, BetterAuth | I
       };
     }),
   );
+
+export const selfHostMcpAuth = makeSelfHostMcpAuth();

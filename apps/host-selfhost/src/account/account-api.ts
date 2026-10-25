@@ -1,9 +1,10 @@
+import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Layer } from "effect";
 
 import { accountProviderMiddlewareLayer } from "@executor-js/api/server";
 
 import { BetterAuth, type BetterAuthHandle } from "../auth/better-auth";
-import { betterAuthAccountProvider } from "./better-auth-account-provider";
+import { makeBetterAuthAccountProvider } from "./better-auth-account-provider";
 
 // ---------------------------------------------------------------------------
 // Self-host account seam: the per-request `AccountProvider` middleware backed by
@@ -21,7 +22,12 @@ import { betterAuthAccountProvider } from "./better-auth-account-provider";
 // `requestScopedMiddleware`).
 // ---------------------------------------------------------------------------
 
-export const selfHostAccountMiddleware = (betterAuth: BetterAuthHandle) =>
+export const selfHostAccountMiddleware = (
+  betterAuth: BetterAuthHandle,
+  forkFeatures: ForkFeatures = forkFeaturesOff,
+) =>
   accountProviderMiddlewareLayer(
-    betterAuthAccountProvider.pipe(Layer.provide(Layer.succeed(BetterAuth)(betterAuth))),
+    makeBetterAuthAccountProvider(forkFeatures).pipe(
+      Layer.provide(Layer.succeed(BetterAuth)(betterAuth)),
+    ),
   );

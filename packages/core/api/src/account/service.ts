@@ -1,3 +1,4 @@
+import type { AccountUnavailable } from "./fork-membership-errors";
 import { Context, type Effect } from "effect";
 
 import {
@@ -47,10 +48,16 @@ type Authed<A, E = never> = Effect.Effect<A, AccountError | AccountUnauthorized 
 type OrgScoped<A, E = never> = Authed<A, AccountNoOrganization | E>;
 
 export interface AccountProviderShape {
-  readonly me: (headers: AccountHeaders) => Authed<Me>;
-  readonly listApiKeys: (headers: AccountHeaders) => OrgScoped<ApiKeys>;
-  readonly createApiKey: (headers: AccountHeaders, name: string) => OrgScoped<CreatedApiKey>;
-  readonly revokeApiKey: (headers: AccountHeaders, apiKeyId: string) => OrgScoped<Success>;
+  readonly me: (headers: AccountHeaders) => Authed<Me, AccountUnavailable>;
+  readonly listApiKeys: (headers: AccountHeaders) => OrgScoped<ApiKeys, AccountUnavailable>;
+  readonly createApiKey: (
+    headers: AccountHeaders,
+    name: string,
+  ) => OrgScoped<CreatedApiKey, AccountUnavailable>;
+  readonly revokeApiKey: (
+    headers: AccountHeaders,
+    apiKeyId: string,
+  ) => OrgScoped<Success, AccountUnavailable>;
   /** Org-owned keys: admin-gated, hence the `AccountForbidden` on both. */
   readonly listOrgApiKeys: (headers: AccountHeaders) => OrgScoped<OrgApiKeys, AccountForbidden>;
   readonly createOrgApiKey: (

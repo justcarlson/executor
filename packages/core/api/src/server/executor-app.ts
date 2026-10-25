@@ -1,3 +1,4 @@
+import type { ForkFeatures } from "@executor-js/sdk/core";
 // ---------------------------------------------------------------------------
 // ExecutorApp.make — the single composition facade every product host calls.
 //
@@ -273,6 +274,7 @@ export interface AppExtensions {
 export type { IdentityFailure };
 
 export interface AppConfig<RStrategy, McpExport> {
+  readonly forkFeatures?: ForkFeatures;
   /**
    * Serve the typed API under this path prefix ("/api"). make() builds the
    * `router.prefixed(mountPrefix)` view internally; omit to serve at root.
@@ -538,10 +540,10 @@ export const make = <
   const apiLive: AppRouteLayer = providers.account
     ? Layer.merge(
         pluginApiLive,
-        makeAccountApiLayer(
-          providers.account as Layer.Layer<unknown, never, RAcct>,
-          prefixedRouter ? { router: prefixedRouter } : {},
-        ) as AppRouteLayer,
+        makeAccountApiLayer(providers.account as Layer.Layer<unknown, never, RAcct>, {
+          ...(prefixedRouter ? { router: prefixedRouter } : {}),
+          forkFeatures: config.forkFeatures,
+        }) as AppRouteLayer,
       )
     : pluginApiLive;
 

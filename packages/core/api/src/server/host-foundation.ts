@@ -35,10 +35,10 @@ import { HttpApiBuilder } from "effect/unstable/httpapi";
 import { HttpRouter, HttpServer } from "effect/unstable/http";
 import { Layer } from "effect";
 import type { AnyPlugin } from "@executor-js/sdk";
+import type { ForkFeatures } from "@executor-js/sdk/core";
 
 import { observabilityMiddleware, type ErrorCapture } from "../observability";
-import { AccountHttpApi } from "../account/api";
-import { AccountHandlers } from "../account/handlers";
+import { makeAccountHttpApi, makeAccountHandlers } from "../account/fork-account-api";
 import type { AccountProvider } from "../account/service";
 import { AdminUsersHttpApi } from "../admin/api";
 import { AdminUsersHandlers } from "../admin/handlers";
@@ -125,6 +125,7 @@ export const makeProtectedApiLayer = <TPlugins extends readonly AnyPlugin[]>(
 // ---------------------------------------------------------------------------
 
 export interface MakeAccountApiLayerOptions {
+  readonly forkFeatures?: ForkFeatures;
   /**
    * Optional prefixed `HttpRouter` view, matching the protected API's prefix so
    * the account routes register on the same `/api`-prefixed router.
@@ -164,8 +165,8 @@ export const makeAccountApiLayer = <MOut, ME, MR>(
   accountProviderMiddleware: Layer.Layer<MOut, ME, MR>,
   options: MakeAccountApiLayerOptions = {},
 ) => {
-  const base = HttpApiBuilder.layer(AccountHttpApi).pipe(
-    Layer.provide(AccountHandlers),
+  const base = HttpApiBuilder.layer(makeAccountHttpApi(options.forkFeatures)).pipe(
+    Layer.provide(makeAccountHandlers(options.forkFeatures)),
     Layer.provide(accountProviderMiddleware),
   );
   return options.router ? base.pipe(Layer.provide(options.router)) : base;

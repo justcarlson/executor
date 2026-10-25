@@ -1,7 +1,8 @@
+import { requireInstanceMembership } from "../auth/membership";
 import { forkFeaturesOff, type ForkFeatures } from "@executor-js/sdk/core";
 import { Effect, Layer } from "effect";
 
-import { IdentityProvider } from "@executor-js/api/server";
+import { IdentityProvider, type NoOrganization, type Unavailable } from "@executor-js/api/server";
 import type {
   McpAuthProvider,
   McpErrorReporter,
@@ -13,7 +14,7 @@ import { BetterAuth, type BetterAuthHandle } from "../auth/better-auth";
 import { resolveSelfHostOrgRole } from "../auth/identity";
 import type { SelfHostDbHandle } from "../db/self-host-db";
 import type { SelfHostConfig } from "../config";
-import { selfHostMcpAuth } from "./auth";
+import { makeSelfHostMcpAuth } from "./auth";
 import {
   makeSelfHostMcpSessionStore,
   selfHostMcpReporter,
@@ -89,9 +90,14 @@ const principalFromSession = (
   resolved: BetterAuthSession,
   betterAuth: BetterAuthHandle,
   headers: Headers,
-): Effect.Effect<Principal> => {
+  forkFeatures: ForkFeatures,
+): Effect.Effect<Principal, NoOrganization | Unavailable> => {
   const organizationId = resolved.session.activeOrganizationId ?? betterAuth.organizationId;
-  return resolveSelfHostOrgRole(betterAuth, headers, organizationId).pipe(
+  return (
+    forkFeatures.has("current-membership")
+      ? requireInstanceMembership(betterAuth, resolved.user.id, organizationId)
+      : resolveSelfHostOrgRole(betterAuth, headers, organizationId)
+  ).pipe(
     Effect.map((orgRole) => ({
       accountId: resolved.user.id,
       organizationId,
@@ -117,6 +123,7 @@ const makeApprovalHandler =
   (
     store: ReturnType<typeof makeSelfHostMcpSessionStore>,
     betterAuth: BetterAuthHandle,
+    forkFeatures: ForkFeatures,
   ): ((request: Request) => Promise<Response>) =>
   async (request) => {
     // A malformed cookie must read as unauthenticated, not 500.
@@ -127,14 +134,22 @@ const makeApprovalHandler =
       }).pipe(Effect.orElseSucceed(() => null)),
     );
     if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
-    const principal = await Effect.runPromise(
-      principalFromSession(session, betterAuth, request.headers),
-    );
-
-    return (
-      (await store.handlePausedRequest(request, principal)) ??
-      (await store.handleApprovalRequest(request, principal)) ??
-      jsonResponse({ error: "Not found" }, 404)
+    return Effect.runPromise(
+      principalFromSession(session, betterAuth, request.headers, forkFeatures).pipe(
+        Effect.flatMap((principal) =>
+          Effect.promise(
+            async () =>
+              (await store.handlePausedRequest(request, principal)) ??
+              (await store.handleApprovalRequest(request, principal)) ??
+              jsonResponse({ error: "Not found" }, 404),
+          ),
+        ),
+        Effect.catchTags({
+          NoOrganization: () => Effect.succeed(jsonResponse({ error: "Forbidden" }, 403)),
+          Unavailable: () =>
+            Effect.succeed(jsonResponse({ error: "Membership lookup unavailable" }, 503)),
+        }),
+      ),
     );
   };
 
@@ -164,14 +179,14 @@ export const makeSelfHostMcpSeams = (
     config.mcpSessionIdleTtlMs,
     forkFeatures,
   );
-  const auth: Layer.Layer<McpAuthProvider, never, IdentityProvider> = selfHostMcpAuth.pipe(
-    Layer.provide(Layer.succeed(BetterAuth)(betterAuth)),
-  );
+  const auth: Layer.Layer<McpAuthProvider, never, IdentityProvider> = makeSelfHostMcpAuth(
+    forkFeatures,
+  ).pipe(Layer.provide(Layer.succeed(BetterAuth)(betterAuth)));
   return {
     auth,
     sessions: selfHostMcpSessions(sessionStore),
     reporter: selfHostMcpReporter,
-    approvalHandler: makeApprovalHandler(sessionStore, betterAuth),
+    approvalHandler: makeApprovalHandler(sessionStore, betterAuth, forkFeatures),
     close: sessionStore.close,
   };
 };
